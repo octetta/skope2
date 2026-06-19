@@ -43,8 +43,9 @@
 #endif
 
 #include "raylib.h"
-#include "scope-ipc.h"
+#include <scope-ipc.h>
 #include "hd44780_font.h"
+#include "hershey_simplex.h"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -77,7 +78,7 @@
 static const char *kDefaultName = SKRED_SCOPE_DEFAULT_NAME;
 
 // Pair names shown in the UI
-static const char *kPairName[SKOPE_NUM_PAIRS] = { "Main", "Tr1", "Tr2", "Tr3", "Tr4" };
+static const char *kDefaultPairName[SKOPE_NUM_PAIRS] = { "Main", "Tr1", "Tr2", "Tr3", "Tr4" };
 
 // ---------------------------------------------------------------------------
 // Theme — dark (phosphor) and light (paper/daylight) modes
@@ -148,9 +149,16 @@ static const skope_theme_t kThemeLight = {
 static Font   g_hd_font;
 static int    g_hd_cell_w;   // pixel width of one character cell (at chosen scale)
 static int    g_hd_cell_h;   // pixel height of one character cell
-static int    g_vector_font; // mirrors s->vector_font; synced once per frame
-                              // in skope_draw so tek_text/tek_measure (which
-                              // don't take skope_t*) can see the current mode
+typedef enum {
+  TEXT_LCD = 0,
+  TEXT_VECTOR,
+  TEXT_HERSHEY,
+  TEXT_COUNT
+} text_mode_t;
+
+static text_mode_t g_text_mode; // mirrors s->text_mode; synced once per frame
+                                // in skope_draw so tek_text/tek_measure (which
+                                // don't take skope_t*) can see the current mode
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -216,6 +224,9 @@ typedef struct {
   trace_t history[SKOPE_TRACE_HISTORY];
   int     history_head;
   int     history_count;
+  uint32_t sample_capacity;
+  uint64_t view_offset_frames; // 0 = newest window; positive = scrolled older
+  int     view_dirty;
 
   // pairs
   pair_state_t pairs[SKOPE_NUM_PAIRS];
@@ -241,7 +252,7 @@ typedef struct {
   int          paused;
   int          dark_mode;       // 1 = dark (phosphor), 0 = light (paper)
   const skope_theme_t *theme;  // pointer into kThemeDark or kThemeLight
-  int          vector_font;    // 1 = stroke/vector text, 0 = bitmap LCD text
+  text_mode_t  text_mode;      // LCD bitmap, HD44780 vector, or Hershey simplex
 
   // window
   int    base_width, base_height;
@@ -310,6 +321,7 @@ static int    skope_handle_input(skope_t *s);  // returns 1 if any input consume
 static void   skope_draw(skope_t *s);
 static void   skope_draw_grid(Rectangle plot, int divs_x, int divs_y,
                                float dpi_scale, const skope_theme_t *th);
+static int    frames_for_window(skope_t *s, int available);
 static void   skope_draw_stacked(skope_t *s, const trace_t *t,
                                   Rectangle plot, float alpha);
 static void   skope_draw_overlay(skope_t *s, const trace_t *t,
@@ -318,8 +330,16 @@ static void   skope_draw_lissajous(skope_t *s, const trace_t *t,
                                     Rectangle plot, float alpha);
 static void   skope_draw_hud(skope_t *s, float hud_y, float hud_h);
 static void   skope_draw_help(skope_t *s);
+static void   skope_draw_buffer_overview(skope_t *s, Rectangle r);
 static int    skope_find_trigger(skope_t *s, const float *samples,
                                   int frames, int *out_idx);
+static int    skope_ensure_sample_capacity(skope_t *s, uint32_t frames);
+static int    skope_reader_window(const skred_scope_reader_t *reader,
+                                  uint64_t first_frame, uint32_t count,
+                                  float *output);
+static const char *skope_pair_name(skope_t *s, int pair);
+static float  skope_pair_db(skope_t *s, int pair);
+static const char *text_mode_name(text_mode_t mode);
 static double skope_now(void);
 static void   skope_sleep(double s);
 static uint64_t shm_load64(const volatile uint64_t *v);
@@ -436,7 +456,7 @@ static void skope_init(skope_t *s, const char *name) {
   s->paused        = 0;
   s->dark_mode     = 1;
   s->theme         = &kThemeDark;
-  s->vector_font   = 0;  // default to bitmap LCD look; K toggles vector strokes
+  s->text_mode     = TEXT_LCD;  // K cycles LCD, vector, Hershey stroke text
 
   s->base_width    = 1100;
   s->base_height   = 720;
@@ -451,6 +471,9 @@ static void skope_init(skope_t *s, const char *name) {
   }
   s->history_head  = -1;
   s->history_count = 0;
+  s->sample_capacity = SKOPE_CAPTURE_FRAMES;
+  s->view_offset_frames = 0;
+  s->view_dirty = 1;
   s->last_connect_attempt = -1e9;
 }
 
@@ -473,11 +496,90 @@ static uint64_t shm_load64(const volatile uint64_t *v) {
 #endif
 }
 
+static int skope_ensure_sample_capacity(skope_t *s, uint32_t frames) {
+  if (frames <= s->sample_capacity) return 1;
+  float *scratch = realloc(s->scratch,
+                           (size_t)frames * RECORD_CHANNELS * sizeof(float));
+  if (!scratch) return 0;
+  s->scratch = scratch;
+
+  for (int i = 0; i < SKOPE_TRACE_HISTORY; i++) {
+    float *samples = realloc(s->history[i].samples,
+                             (size_t)frames * RECORD_CHANNELS * sizeof(float));
+    if (!samples) return 0;
+    s->history[i].samples = samples;
+  }
+  s->sample_capacity = frames;
+  return 1;
+}
+
+static int skope_reader_window(const skred_scope_reader_t *reader,
+                               uint64_t first_frame, uint32_t count,
+                               float *output) {
+  if (!reader || !reader->header || !output || count == 0) return -1;
+  uint32_t capacity = reader->header->capacity_frames;
+  if (capacity == 0 || count > capacity) return -1;
+
+  for (int attempt = 0; attempt < 8; attempt++) {
+    uint64_t sequence_before = shm_load64(&reader->header->sequence);
+    if (sequence_before & 1) continue;
+
+    uint64_t write_frame = shm_load64(&reader->header->write_frame);
+    uint32_t available = write_frame < capacity
+      ? (uint32_t)write_frame : capacity;
+    uint64_t oldest = write_frame - available;
+    if (first_frame < oldest || first_frame + count > write_frame) return 0;
+
+    uint32_t offset = (uint32_t)(first_frame % capacity);
+    uint32_t first_count = capacity - offset;
+    if (first_count > count) first_count = count;
+    memcpy(output, reader->frames + (size_t)offset * SKRED_SCOPE_CHANNELS,
+           (size_t)first_count * SKRED_SCOPE_CHANNELS * sizeof(float));
+    if (first_count < count) {
+      memcpy(output + (size_t)first_count * SKRED_SCOPE_CHANNELS,
+             reader->frames,
+             (size_t)(count - first_count) * SKRED_SCOPE_CHANNELS * sizeof(float));
+    }
+
+    uint64_t sequence_after = shm_load64(&reader->header->sequence);
+    if (sequence_before == sequence_after && !(sequence_after & 1))
+      return (int)count;
+  }
+  return 0;
+}
+
+static const char *skope_pair_name(skope_t *s, int pair) {
+  if (s->connected && s->reader.header &&
+      pair >= 0 && pair < (int)s->reader.header->track_count &&
+      s->reader.header->track_name[pair][0]) {
+    return s->reader.header->track_name[pair];
+  }
+  return kDefaultPairName[pair];
+}
+
+static float skope_pair_db(skope_t *s, int pair) {
+  if (s->connected && s->reader.header &&
+      pair >= 0 && pair < (int)s->reader.header->track_count) {
+    return s->reader.header->track_volume_db[pair];
+  }
+  return NAN;
+}
+
+static const char *text_mode_name(text_mode_t mode) {
+  switch (mode) {
+    case TEXT_LCD:     return "LCD";
+    case TEXT_VECTOR:  return "VECT";
+    case TEXT_HERSHEY: return "HERSH";
+    default:           return "?";
+  }
+}
+
 static int skope_try_connect(skope_t *s) {
   if (scope_ipc_reader_open(&s->reader, s->name) != 0) return 0;
   s->connected     = 1;
   s->last_write_frame = shm_load64(&s->reader.header->write_frame);
   s->last_generation  = s->reader.header->generation;
+  skope_ensure_sample_capacity(s, s->reader.header->capacity_frames);
   return 1;
 }
 
@@ -559,25 +661,40 @@ static int skope_poll(skope_t *s) {
     return 0;
   }
 
-  if (s->paused) return 0;
+  if (s->paused && !s->view_dirty) return 0;
 
   uint64_t wf = shm_load64(&s->reader.header->write_frame);
-  if (wf == s->last_write_frame) return 0;
+  if (wf == s->last_write_frame && !s->view_dirty) return 0;
   s->last_write_frame = wf;
 
-  uint32_t req = SKOPE_CAPTURE_FRAMES;
-  if (req > s->reader.header->capacity_frames)
-    req = s->reader.header->capacity_frames;
+  uint32_t capacity = s->reader.header->capacity_frames;
+  if (!skope_ensure_sample_capacity(s, capacity)) return 0;
 
-  uint64_t first = 0;
-  int count = scope_ipc_reader_latest(&s->reader, s->scratch, req, &first);
+  uint32_t available = wf < capacity ? (uint32_t)wf : capacity;
+  if (available < 2) return 0;
+  uint64_t oldest = wf - available;
+
+  int win_i = frames_for_window(s, (int)available);
+  uint32_t win = (uint32_t)win_i;
+  uint64_t max_offset = available > win ? (uint64_t)(available - win) : 0;
+  if (s->view_offset_frames > max_offset)
+    s->view_offset_frames = max_offset;
+
+  uint64_t visible_end = wf - s->view_offset_frames;
+  if (visible_end < oldest + win) visible_end = oldest + win;
+  if (visible_end > wf) visible_end = wf;
+  uint64_t first = visible_end - win;
+
+  int count = skope_reader_window(&s->reader, first, win, s->scratch);
   if (count <= 0) return 0;
 
-  // Trigger alignment
+  // Trigger alignment only applies to the live edge of the buffer. Once the
+  // user scrolls back, the visible window is treated as a memory view.
   int trig_idx = 0;
   int have_trig = skope_find_trigger(s, s->scratch, count, &trig_idx);
 
-  if (s->trig_mode == TRIG_NORMAL || s->trig_mode == TRIG_SINGLE) {
+  if (s->view_offset_frames == 0 &&
+      (s->trig_mode == TRIG_NORMAL || s->trig_mode == TRIG_SINGLE)) {
     if (!have_trig) return 0;
     if (s->trig_mode == TRIG_SINGLE && !s->armed) return 0;
     if (now - s->last_trig_time < (double)s->trig_holdoff_s) return 0;
@@ -586,7 +703,8 @@ static int skope_poll(skope_t *s) {
   }
 
   int src_offset = 0;
-  if ((s->trig_mode == TRIG_NORMAL || s->trig_mode == TRIG_SINGLE)
+  if (s->view_offset_frames == 0 &&
+      (s->trig_mode == TRIG_NORMAL || s->trig_mode == TRIG_SINGLE)
       && have_trig) {
     int lead = count / 3;
     src_offset = trig_idx - lead;
@@ -608,6 +726,7 @@ static int skope_poll(skope_t *s) {
 
   s->history_head = next;
   if (s->history_count < SKOPE_TRACE_HISTORY) s->history_count++;
+  s->view_dirty = 0;
   return 1;
 }
 
@@ -622,9 +741,9 @@ static int skope_handle_input(skope_t *s) {
   int held = IsKeyDown(KEY_UP)     || IsKeyDown(KEY_DOWN) ||
              IsKeyDown(KEY_COMMA)  || IsKeyDown(KEY_PERIOD);
   int changed = held || IsWindowResized();
-  // 1-5: toggle pairs
+  // 0-4: toggle pairs/tracks
   for (int p = 0; p < SKOPE_NUM_PAIRS; p++) {
-    if (IsKeyPressed(KEY_ONE + p)) {
+    if (IsKeyPressed(KEY_ZERO + p)) {
       s->pairs[p].enabled = !s->pairs[p].enabled;
       changed = 1;
     }
@@ -707,15 +826,42 @@ static int skope_handle_input(skope_t *s) {
     changed = 1;
   }
 
-  // Time/div: LEFT/RIGHT
-  if (IsKeyPressed(KEY_RIGHT)) {
+  // Time/div: LEFT/RIGHT. Shift+LEFT/RIGHT scrolls the visible window
+  // through the shared-memory buffer instead.
+  int shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+  if (shift && (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT))) {
+    uint32_t capacity = s->connected && s->reader.header
+      ? s->reader.header->capacity_frames : s->sample_capacity;
+    uint64_t wf = s->connected && s->reader.header
+      ? shm_load64(&s->reader.header->write_frame) : 0;
+    uint32_t available = wf < capacity ? (uint32_t)wf : capacity;
+    int win_i = frames_for_window(s, available > 1 ? (int)available : 2);
+    uint64_t max_offset = available > (uint32_t)win_i
+      ? (uint64_t)(available - (uint32_t)win_i) : 0;
+    uint64_t step = (uint64_t)(win_i / 4);
+    if (step < 1) step = 1;
+
+    if (IsKeyPressed(KEY_LEFT)) {
+      uint64_t next = s->view_offset_frames + step;
+      s->view_offset_frames = next > max_offset ? max_offset : next;
+    }
+    if (IsKeyPressed(KEY_RIGHT)) {
+      s->view_offset_frames = s->view_offset_frames > step
+      ? s->view_offset_frames - step : 0;
+    }
+    s->view_dirty = 1;
+    changed = 1;
+  } else if (IsKeyPressed(KEY_RIGHT)) {
     s->time_per_div_s *= 2.0f;
     if (s->time_per_div_s > 1.0f) s->time_per_div_s = 1.0f;
+    s->view_offset_frames = 0;
+    s->view_dirty = 1;
     changed = 1;
-  }
-  if (IsKeyPressed(KEY_LEFT)) {
+  } else if (IsKeyPressed(KEY_LEFT)) {
     s->time_per_div_s *= 0.5f;
     if (s->time_per_div_s < 0.00005f) s->time_per_div_s = 0.00005f;
+    s->view_offset_frames = 0;
+    s->view_dirty = 1;
     changed = 1;
   }
 
@@ -741,9 +887,9 @@ static int skope_handle_input(skope_t *s) {
     changed = 1;
   }
 
-  // K — toggle vector-stroke font vs bitmap LCD font
+  // K — cycle bitmap LCD, HD44780 vector, Hershey simplex stroke font
   if (IsKeyPressed(KEY_K)) {
-    s->vector_font = !s->vector_font;
+    s->text_mode = (text_mode_t)((s->text_mode + 1) % TEXT_COUNT);
     changed = 1;
   }
 
@@ -761,6 +907,8 @@ static int skope_handle_input(skope_t *s) {
     }
     s->time_per_div_s = 0.005f;
     s->trig_level     = 0.0f;
+    s->view_offset_frames = 0;
+    s->view_dirty = 1;
     changed = 1;
   }
 
@@ -945,27 +1093,23 @@ static void draw_pair_waveforms(Rectangle band,
   }
 }
 
-// tek_text / tek_measure — draw and measure text using the HD44780 font.
-// The font is loaded once at startup into g_hd_font; all text in skope goes
-// through these two wrappers so the HD44780 look is applied everywhere.
-// When g_vector_font is set, text is drawn as connected line strokes
-// (see hd44780_draw_text_vector) instead of the baked bitmap atlas.
+// tek_text / tek_measure — draw and measure text using the selected scope
+// readout font. The wrappers keep layout code independent of the current
+// rendering mode.
 static void tek_text(const char *txt, int x, int y, int size, Color col) {
-  // size param is accepted for API compatibility but ignored —
-  // the HD44780 font has a single fixed pixel size (g_hd_cell_h).
-  (void)size;
-  if (g_vector_font) {
+  (void)size; // most callers pass g_hd_cell_h; keep the API stable.
+  if (g_text_mode == TEXT_HERSHEY) {
+    hs_text(txt, x, y, g_hd_cell_h, col);
+  } else if (g_text_mode == TEXT_VECTOR) {
     hd44780_draw_text_vector(txt, x, y, g_hd_cell_w, g_hd_cell_h, col);
   } else {
     hd_draw(g_hd_font, txt, x, y, col);
   }
 }
 
-// tek_measure — pixel width of a string in the HD44780 font.
-// Both modes use the same per-character advance (g_hd_cell_w), so layout
-// code never needs to know which rendering mode is active.
 static int tek_measure(const char *txt) {
-  if (g_vector_font) return hd44780_measure_vector(txt, g_hd_cell_w);
+  if (g_text_mode == TEXT_HERSHEY) return hs_measure(txt, g_hd_cell_h);
+  if (g_text_mode == TEXT_VECTOR) return hd44780_measure_vector(txt, g_hd_cell_w);
   return hd_measure(g_hd_font, txt);
 }
 
@@ -1044,10 +1188,11 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
     // Row 0 (top of band): pair name + "L" "R" legend + V/div right-aligned
     int row0_y = (int)(band_y + 2);
 
-    tek_text(kPairName[p], (int)(plot.x + mkr_sz + fw),
+    const char *pname = skope_pair_name(s, p);
+    tek_text(pname, (int)(plot.x + mkr_sz + fw),
              row0_y, fh, lcol);
 
-    int lbl_w = tek_measure(kPairName[p]);
+    int lbl_w = tek_measure(pname);
     int leg_x = (int)(plot.x + mkr_sz + fw) + lbl_w + fw;
     tek_text("L", leg_x,            row0_y, fh, lcol);
     tek_text("R", leg_x + fw * 2,   row0_y, fh, rcol);
@@ -1060,7 +1205,11 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
     char scale_str[32];
     float dbfs = (vpd > 0.0f) ? 20.0f * log10f(vpd) : -99.0f;
     if (dbfs < -99.0f) dbfs = -99.0f;
-    snprintf(scale_str, sizeof(scale_str), "%.2f/D(%.0fDB)", vpd, dbfs);
+    float track_db = skope_pair_db(s, p);
+    if (isfinite(track_db))
+      snprintf(scale_str, sizeof(scale_str), "%.0fDB %.2f/D", track_db, vpd);
+    else
+      snprintf(scale_str, sizeof(scale_str), "%.2f/D(%.0fDB)", vpd, dbfs);
     int vw = tek_measure(scale_str);
     tek_text(scale_str, (int)(band.x + usable_w - vw - fw),
              row0_y, fh, color_alpha(TH(s, p31_mid), alpha));
@@ -1244,7 +1393,7 @@ static void draw_lissajous_cell(skope_t *s, const trace_t *t,
 
   // Pair name — top-left of cell
   Color lcol = color_alpha(kPairColor[p], alpha);
-  tek_text(kPairName[p],
+  tek_text(skope_pair_name(s, p),
            (int)(cell.x + g_hd_cell_w),
            (int)(cell.y + 3),
            g_hd_cell_h, lcol);
@@ -1315,7 +1464,7 @@ static const char *view_name(view_mode_t v) {
 
 static void skope_draw(skope_t *s) {
   int sw = GetScreenWidth(), sh = GetScreenHeight();
-  g_vector_font = s->vector_font;   // sync once per frame for tek_text/tek_measure
+  g_text_mode = s->text_mode;   // sync once per frame for tek_text/tek_measure
 
   // -------------------------------------------------------------------------
   // Layout: bezel border + CRT area + HUD panel at the bottom
@@ -1333,7 +1482,7 @@ static void skope_draw(skope_t *s) {
   // -------------------------------------------------------------------------
 
   float bpad_x = 22.0f * s->dpi_x;   // left/right bezel width
-  float bpad_t  = 28.0f * s->dpi_y;  // top bezel (leaves room for Tek logo)
+  float bpad_t  = 48.0f * s->dpi_y;  // top bezel (title + buffer overview)
   float bpad_b  =  8.0f * s->dpi_y;  // bottom bezel (below HUD)
   // HUD height: 2 status rows + button row + gaps
   // g_hd_cell_h is available after InitWindow(), so this is safe.
@@ -1402,6 +1551,13 @@ static void skope_draw(skope_t *s) {
       ? TH(s, amber) : TH(s, p31_dim);
     tek_text(right, (int)((float)sw - bpad_x - rw), by0, g_hd_cell_h, rc);
   }
+
+  skope_draw_buffer_overview(s, (Rectangle){
+    bpad_x,
+    bpad_t - 18.0f * s->dpi_y,
+    (float)sw - bpad_x * 2.0f,
+    10.0f * s->dpi_y
+  });
 
   // -------------------------------------------------------------------------
   // CRT face
@@ -1528,6 +1684,48 @@ static void skope_draw(skope_t *s) {
   if (s->show_help) skope_draw_help(s);
 }
 
+static void skope_draw_buffer_overview(skope_t *s, Rectangle r) {
+  Color frame = TH(s, p31_dim);
+  Color dim = (Color){frame.r, frame.g, frame.b, 70};
+  Color fill = TH(s, btn_active);
+
+  DrawLineEx((Vector2){r.x, r.y + r.height / 2.0f},
+             (Vector2){r.x + r.width, r.y + r.height / 2.0f},
+             fmaxf(1.0f, s->dpi_y), dim);
+  DrawLineEx((Vector2){r.x, r.y},
+             (Vector2){r.x, r.y + r.height},
+             fmaxf(1.0f, s->dpi_y), frame);
+  DrawLineEx((Vector2){r.x + r.width, r.y},
+             (Vector2){r.x + r.width, r.y + r.height},
+             fmaxf(1.0f, s->dpi_y), frame);
+
+  if (!s->connected || !s->reader.header || s->history_head < 0) return;
+
+  uint64_t wf = shm_load64(&s->reader.header->write_frame);
+  uint32_t capacity = s->reader.header->capacity_frames;
+  uint32_t available = wf < capacity ? (uint32_t)wf : capacity;
+  if (available < 2) return;
+
+  uint64_t oldest = wf - available;
+  trace_t *t = &s->history[s->history_head];
+  uint64_t vis0 = t->first_frame;
+  uint64_t vis1 = t->first_frame + (uint64_t)t->frame_count;
+  if (vis0 < oldest) vis0 = oldest;
+  if (vis1 > wf) vis1 = wf;
+  if (vis1 <= vis0) return;
+
+  float denom = (float)(wf - oldest);
+  if (denom < 1.0f) denom = 1.0f;
+  float x0 = r.x + ((float)(vis0 - oldest) / denom) * r.width;
+  float x1 = r.x + ((float)(vis1 - oldest) / denom) * r.width;
+  if (x1 - x0 < 3.0f * s->dpi_x) x1 = x0 + 3.0f * s->dpi_x;
+  if (x1 > r.x + r.width) x1 = r.x + r.width;
+
+  Rectangle win = {x0, r.y, x1 - x0, r.height};
+  DrawRectangleRec(win, (Color){fill.r, fill.g, fill.b, 90});
+  DrawRectangleLinesEx(win, fmaxf(1.0f, s->dpi_y), fill);
+}
+
 // ---------------------------------------------------------------------------
 // HUD
 // ---------------------------------------------------------------------------
@@ -1571,7 +1769,8 @@ static void skope_draw_hud(skope_t *s, float hud_y, float hud_h) {
     // Pair chips — right-aligned on the same row
     int chip_x = sw - pad;
     for (int p = SKOPE_NUM_PAIRS - 1; p >= 0; p--) {
-      int label_w = tek_measure(kPairName[p]);
+      const char *pname = skope_pair_name(s, p);
+      int label_w = tek_measure(pname);
       int cw = label_w + fw * 2;   // 1-char padding each side
       chip_x -= cw + 2;
 
@@ -1589,7 +1788,7 @@ static void skope_draw_hud(skope_t *s, float hud_y, float hud_h) {
         (Rectangle){(float)chip_x,(float)y,(float)cw,(float)(fh+2)},
         bthick, border);
       // Disabled chips are dim; selected gets a tiny selection dot above
-      tek_text(kPairName[p], chip_x + fw, y + 1, fh, lc);
+      tek_text(pname, chip_x + fw, y + 1, fh, lc);
 
       if (!s->pairs[p].enabled) {
         DrawLine(chip_x + 1, y + fh/2, chip_x + cw - 2, y + fh/2,
@@ -1616,9 +1815,9 @@ static void skope_draw_hud(skope_t *s, float hud_y, float hud_h) {
     snprintf(l2, sizeof(l2),
              "TRIG:%s%s SRC:%s LVL:%+.2f  "
              "%s T:%s  SEL:[%s]  %s",
-             tmode, tedge, kPairName[s->trig_pair], s->trig_level,
+             tmode, tedge, skope_pair_name(s, s->trig_pair), s->trig_level,
              view_name(s->view_mode), tdiv,
-             kPairName[s->selected_pair],
+             skope_pair_name(s, s->selected_pair),
              s->persistence ? "PRST:ON" : "PRST:OFF");
     tek_text(l2, pad, y, fh, TH(s, p31_dim));
   }
@@ -1641,7 +1840,7 @@ static void skope_draw_hud(skope_t *s, float hud_y, float hud_h) {
     { s->paused ? "HOLD" : "RUN",             "SPC", s->paused       },
     { s->show_grid ? "GRID" : "GRID",         "G",   s->show_grid    },
     { s->dark_mode ? "DARK" : "LITE",         "L",   0               },
-    { s->vector_font ? "VECT" : "LCD",        "K",   s->vector_font  },
+    { text_mode_name(s->text_mode),            "K",   s->text_mode != TEXT_LCD },
     { "RESET",                                "R",   0               },
     { "HELP",                                 "/",   s->show_help    },
   };
@@ -1704,7 +1903,7 @@ static void skope_draw_help(skope_t *s) {
 
   static const char *col_a[] = {
     "-- CHANNELS --",
-    "1-5    TOGGLE PAIR",
+    "0-4    TOGGLE TRACK",
     "[ / ]  SELECT PAIR",
     "+/-    VERT SCALE",
     ",.     VERT POSITION",
@@ -1720,6 +1919,8 @@ static void skope_draw_help(skope_t *s) {
   static const char *col_b[] = {
     "-- TIMEBASE --",
     "LT/RT  TIME/DIV",
+    "S+LT   SCROLL OLDER",
+    "S+RT   SCROLL NEWER",
     "",
     "-- DISPLAY --",
     "V      VIEW STKD/OVLY/XY",
@@ -1728,7 +1929,7 @@ static void skope_draw_help(skope_t *s) {
     "G      GRID",
     "D      HUD",
     "L      LIGHT/DARK",
-    "K      VECTOR/LCD FONT",
+    "K      LCD/VECT/HERSH",
     "R      RESET",
     "/      THIS HELP",
     "Q      QUIT",

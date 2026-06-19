@@ -6,10 +6,11 @@ shared memory ring buffer written by skred. Built on
 Windows.
 
 ```
-skope [shm-name] [display-frames] [iterations]
+skope [shm-name]
 ```
 
-Defaults: `shm-name = skred-scope`, free-run.
+Defaults: `shm-name = skred-scope`. The app reconnects automatically while it
+waits for skred to publish the shared-memory scope buffer.
 
 ---
 
@@ -44,7 +45,7 @@ RECORD_CHANNELS = RECORD_TRACK_COUNT * AUDIO_CHANNELS = 5 * 2 = 10
 | macOS    | Xcode command line tools |
 | Windows  | Visual Studio 2022, or MinGW/MSYS2 |
 
-raylib is fetched automatically from GitHub by CMake (tag 5.0) unless you
+raylib is fetched automatically from GitHub by CMake (tag 5.5) unless you
 have a system installation.
 
 ### Quick build (Linux / macOS)
@@ -94,27 +95,17 @@ cmake .. \
   -DSKOPE_SCOPE_IPC_DIR=/path/to/skred/src
 ```
 
-Add this near the top of CMakeLists.txt:
-
-```cmake
-set(SKOPE_SCOPE_IPC_DIR "" CACHE PATH "Path to scope-ipc.c / scope-ipc.h")
-if(SKOPE_SCOPE_IPC_DIR)
-  target_sources(skope PRIVATE ${SKOPE_SCOPE_IPC_DIR}/scope-ipc.c)
-  target_include_directories(skope PRIVATE ${SKOPE_SCOPE_IPC_DIR})
-endif()
-```
-
 ---
 
 ## Keyboard shortcuts
 
-### Channels
+### Stereo pairs
 
 | Key         | Action                                      |
 |-------------|---------------------------------------------|
-| `1` – `9`  | Toggle channel on / off                     |
-| `[` / `]`  | Select previous / next channel (for scaling)|
-| `+` / `-`  | Vertical scale ÷2 / ×2 (selected channel)  |
+| `0` – `4`  | Toggle stereo pair / track on or off        |
+| `[` / `]`  | Select previous / next pair for scaling     |
+| `+` / `-`  | Vertical scale ÷2 / ×2 (selected pair)      |
 | `,` / `.`  | Vertical position down / up (hold to sweep) |
 
 ### Trigger
@@ -123,7 +114,7 @@ endif()
 |----------------|-----------------------------------------------|
 | `T`            | Cycle trigger mode: AUTO → NORMAL → SINGLE    |
 | `E`            | Toggle edge: RISING ↔ FALLING                 |
-| `F1`–`F8`     | Set trigger source channel                    |
+| `F1`–`F5`      | Set trigger source pair                       |
 | `↑` / `↓`    | Adjust trigger level (hold Shift = ×5 step)   |
 | `A`            | Re-arm single-shot trigger                    |
 | `H` / `⇧H`   | Increase / decrease holdoff (1 ms steps)      |
@@ -133,10 +124,13 @@ endif()
 | Key          | Action                                   |
 |--------------|------------------------------------------|
 | `←` / `→`  | Time/div ×0.5 / ×2 (50 µs – 1 s range) |
-| `V`          | Toggle OVERLAY ↔ STACKED channel view   |
+| `⇧←` / `⇧→` | Scroll older / newer within the IPC buffer |
+| `V`          | Cycle STACKED → OVERLAY → LISSAJOUS view |
 | `P`          | Toggle phosphor persistence              |
 | `Space`      | Pause / freeze acquisition               |
 | `G`          | Toggle grid                              |
+| `L`          | Toggle dark phosphor / light paper theme |
+| `K`          | Cycle LCD → vector → Hershey text        |
 | `D`          | Toggle HUD / status bar                  |
 | `R`          | Reset all scales and positions           |
 | `/`          | Toggle keyboard help overlay             |
@@ -156,13 +150,27 @@ endif()
 
 ## Display modes
 
-**OVERLAY** — all enabled channels share one plot area. Each has its own
-color, vertical scale (`volts/div`), and vertical offset (in divisions).
-Good for comparing stereo pairs or A vs B bus.
+The thin bar in the top bezel is the buffer overview. Its end ticks mark the
+oldest and newest samples currently present in the shared-memory ring buffer;
+the highlighted segment marks the window being displayed. Use `Shift+Left`
+and `Shift+Right` to scroll that window through the buffered audio.
+
+When the connected IPC header provides track metadata, skope uses the published
+track names in labels and HUD chips and shows each track's synth dB setting next
+to the per-division scope scale.
 
 **STACKED** — the plot is divided into equal horizontal bands, one per
-enabled channel. Labels each band. Good for seeing all 10 channels at once
-without them overlapping.
+enabled stereo pair. Left and right are drawn together in each band, with a
+translucent fill between them and a correlation meter on the right edge.
+Good for seeing the full bus and track set without overlap.
+
+**OVERLAY** — all enabled pairs share one plot area. Each pair has its own
+color, vertical scale (`volts/div`), and vertical offset (in divisions).
+Left is drawn solid, right is dimmer, and the fill shows stereo spread.
+
+**LISSAJOUS** — X/Y phase scope where left is X and right is Y. Enabled
+pairs are shown as cells, which is useful for checking mono compatibility,
+stereo imaging, and mid/side balance.
 
 ---
 
@@ -188,7 +196,7 @@ is idle or skope is paused.
 
 ## HiDPI / Retina
 
-`FLAG_WINDOW_HIGHDPI` is set at startup; raylib 5.0 scales the
+`FLAG_WINDOW_HIGHDPI` is set at startup; raylib 5.5 scales the
 framebuffer accordingly on macOS Retina and Windows high-DPI displays.
 `GetWindowScaleDPI()` is queried once after window creation and stored in
 `dpi_scale_x/y`; all font sizes and line widths are multiplied through it.

@@ -11,6 +11,16 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 option(SKOPE_DOWNLOAD_RAYLIB
   "Fetch raylib from GitHub if not found on the system" ON)
 
+set(SKOPE_SCOPE_IPC_DIR "" CACHE PATH
+  "Optional directory containing scope-ipc.c and scope-ipc.h from skred")
+
+if(SKOPE_SCOPE_IPC_DIR AND
+   (NOT EXISTS "${SKOPE_SCOPE_IPC_DIR}/scope-ipc.c" OR
+    NOT EXISTS "${SKOPE_SCOPE_IPC_DIR}/scope-ipc.h"))
+  message(FATAL_ERROR
+    "SKOPE_SCOPE_IPC_DIR must contain scope-ipc.c and scope-ipc.h")
+endif()
+
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
@@ -66,21 +76,35 @@ endif()
 
 set(SKOPE_SOURCES
   src/skope.c
-  src/scope-ipc.c
 )
+
+if(SKOPE_SCOPE_IPC_DIR)
+  list(APPEND SKOPE_SOURCES "${SKOPE_SCOPE_IPC_DIR}/scope-ipc.c")
+else()
+  list(APPEND SKOPE_SOURCES src/scope-ipc.c)
+endif()
 
 add_executable(skope ${SKOPE_SOURCES})
 
 # ---------------------------------------------------------------------------
 # Include paths
 #   compat/   provides synth-types.h and portable_atomic.h
-#   src/      provides scope-ipc.h (already there after the copy step)
+#   src/      provides local project headers and bundled scope-ipc.h
+#   SKOPE_SCOPE_IPC_DIR, when set, is searched first for scope-ipc.h
 # ---------------------------------------------------------------------------
 
-target_include_directories(skope PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/compat
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
+if(SKOPE_SCOPE_IPC_DIR)
+  target_include_directories(skope PRIVATE
+    ${SKOPE_SCOPE_IPC_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/compat
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+else()
+  target_include_directories(skope PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/compat
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+endif()
 
 # scope-ipc.c uses ftruncate, shm_open, nanosleep etc — needs POSIX 2008
 target_compile_definitions(skope PRIVATE _POSIX_C_SOURCE=200809L)
@@ -169,4 +193,9 @@ install(TARGETS skope RUNTIME DESTINATION bin)
 message(STATUS "skope build:")
 message(STATUS "  C standard  : ${CMAKE_C_STANDARD}")
 message(STATUS "  Build type  : ${CMAKE_BUILD_TYPE}")
+if(SKOPE_SCOPE_IPC_DIR)
+  message(STATUS "  scope-ipc   : ${SKOPE_SCOPE_IPC_DIR}")
+else()
+  message(STATUS "  scope-ipc   : bundled")
+endif()
 message(STATUS "  RECORD_CHANNELS: 10 (from synth-types.h)")

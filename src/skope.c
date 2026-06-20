@@ -44,8 +44,8 @@
 
 #include "raylib.h"
 #include <scope-ipc.h>
+#include "atari_vector_font.h"
 #include "hd44780_font.h"
-#include "hershey_simplex.h"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -151,8 +151,7 @@ static int    g_hd_cell_w;   // pixel width of one character cell (at chosen sca
 static int    g_hd_cell_h;   // pixel height of one character cell
 typedef enum {
   TEXT_LCD = 0,
-  TEXT_VECTOR,
-  TEXT_HERSHEY,
+  TEXT_ATARI,
   TEXT_COUNT
 } text_mode_t;
 
@@ -252,7 +251,7 @@ typedef struct {
   int          paused;
   int          dark_mode;       // 1 = dark (phosphor), 0 = light (paper)
   const skope_theme_t *theme;  // pointer into kThemeDark or kThemeLight
-  text_mode_t  text_mode;      // LCD bitmap, HD44780 vector, or Hershey simplex
+  text_mode_t  text_mode;      // LCD bitmap or Atari vector-style stroke text
 
   // window
   int    base_width, base_height;
@@ -456,7 +455,7 @@ static void skope_init(skope_t *s, const char *name) {
   s->paused        = 0;
   s->dark_mode     = 1;
   s->theme         = &kThemeDark;
-  s->text_mode     = TEXT_LCD;  // K cycles LCD, vector, Hershey stroke text
+  s->text_mode     = TEXT_LCD;  // K cycles LCD and Atari vector-style text
 
   s->base_width    = 1100;
   s->base_height   = 720;
@@ -568,8 +567,7 @@ static float skope_pair_db(skope_t *s, int pair) {
 static const char *text_mode_name(text_mode_t mode) {
   switch (mode) {
     case TEXT_LCD:     return "LCD";
-    case TEXT_VECTOR:  return "VECT";
-    case TEXT_HERSHEY: return "HERSH";
+    case TEXT_ATARI:   return "ATARI";
     default:           return "?";
   }
 }
@@ -887,7 +885,7 @@ static int skope_handle_input(skope_t *s) {
     changed = 1;
   }
 
-  // K — cycle bitmap LCD, HD44780 vector, Hershey simplex stroke font
+  // K — cycle bitmap LCD and Atari vector-style stroke font
   if (IsKeyPressed(KEY_K)) {
     s->text_mode = (text_mode_t)((s->text_mode + 1) % TEXT_COUNT);
     changed = 1;
@@ -1098,18 +1096,15 @@ static void draw_pair_waveforms(Rectangle band,
 // rendering mode.
 static void tek_text(const char *txt, int x, int y, int size, Color col) {
   (void)size; // most callers pass g_hd_cell_h; keep the API stable.
-  if (g_text_mode == TEXT_HERSHEY) {
-    hs_text(txt, x, y, g_hd_cell_h, col);
-  } else if (g_text_mode == TEXT_VECTOR) {
-    hd44780_draw_text_vector(txt, x, y, g_hd_cell_w, g_hd_cell_h, col);
+  if (g_text_mode == TEXT_ATARI) {
+    avf_text(txt, x, y, g_hd_cell_h, col);
   } else {
     hd_draw(g_hd_font, txt, x, y, col);
   }
 }
 
 static int tek_measure(const char *txt) {
-  if (g_text_mode == TEXT_HERSHEY) return hs_measure(txt, g_hd_cell_h);
-  if (g_text_mode == TEXT_VECTOR) return hd44780_measure_vector(txt, g_hd_cell_w);
+  if (g_text_mode == TEXT_ATARI) return avf_measure(txt, g_hd_cell_h);
   return hd_measure(g_hd_font, txt);
 }
 
@@ -1207,9 +1202,10 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
     if (dbfs < -99.0f) dbfs = -99.0f;
     float track_db = skope_pair_db(s, p);
     if (isfinite(track_db))
-      snprintf(scale_str, sizeof(scale_str), "%.0fDB %.2f/D", track_db, vpd);
+      snprintf(scale_str, sizeof(scale_str), "VOL%+.0fdB %.2f/D",
+               track_db, vpd);
     else
-      snprintf(scale_str, sizeof(scale_str), "%.2f/D(%.0fDB)", vpd, dbfs);
+      snprintf(scale_str, sizeof(scale_str), "%.2f/D(%.0fdB)", vpd, dbfs);
     int vw = tek_measure(scale_str);
     tek_text(scale_str, (int)(band.x + usable_w - vw - fw),
              row0_y, fh, color_alpha(TH(s, p31_mid), alpha));
@@ -1525,7 +1521,7 @@ static void skope_draw(skope_t *s) {
     if (s->connected && s->reader.header) {
       uint32_t rate = s->reader.header->sample_rate;
       char centre[48];
-      snprintf(centre, sizeof(centre), "%.20s  %uHZ",
+      snprintf(centre, sizeof(centre), "%.20s  %uHz",
                s->reader.name, rate);
       int cw = tek_measure(centre);
       tek_text(centre, sw / 2 - cw / 2, by0, g_hd_cell_h, TH(s, p31_dim));
@@ -1664,9 +1660,9 @@ static void skope_draw(skope_t *s) {
     int margin = g_hd_cell_w;
     char tdiv[24];
     if (s->time_per_div_s >= 0.001f)
-      snprintf(tdiv, sizeof(tdiv), "%.3GMS/DIV", s->time_per_div_s * 1000.f);
+      snprintf(tdiv, sizeof(tdiv), "%.3Gms/DIV", s->time_per_div_s * 1000.f);
     else
-      snprintf(tdiv, sizeof(tdiv), "%.0FUS/DIV", s->time_per_div_s * 1e6f);
+      snprintf(tdiv, sizeof(tdiv), "%.0Fus/DIV", s->time_per_div_s * 1e6f);
     int tw = tek_measure(tdiv);
     tek_text(tdiv,
              (int)(crt.x + crt.width  - tw - margin),
@@ -1756,7 +1752,7 @@ static void skope_draw_hud(skope_t *s, float hud_y, float hud_h) {
       uint32_t cap  = s->reader.header->capacity_frames;
       uint64_t wf   = shm_load64(&s->reader.header->write_frame);
       char l1[128];
-      snprintf(l1, sizeof(l1), "SRC:%.12s %uHZ BUF%.1fS FRM%" PRIu64,
+      snprintf(l1, sizeof(l1), "SRC:%.12s %uHz BUF%.1fs FRM%" PRIu64,
                s->reader.name, rate,
                (double)cap / (rate ? rate : 1), wf);
       tek_text(l1, pad, y, fh, TH(s, p31_mid));
@@ -1807,9 +1803,9 @@ static void skope_draw_hud(skope_t *s, float hud_y, float hud_h) {
     const char *tedge = s->trig_edge == EDGE_RISING ? "/" : "\\";
     char tdiv[16];
     if (s->time_per_div_s >= 0.001f)
-      snprintf(tdiv, sizeof(tdiv), "%.3GMS/D", s->time_per_div_s * 1000.f);
+      snprintf(tdiv, sizeof(tdiv), "%.3Gms/D", s->time_per_div_s * 1000.f);
     else
-      snprintf(tdiv, sizeof(tdiv), "%.0FUS/D", s->time_per_div_s * 1e6f);
+      snprintf(tdiv, sizeof(tdiv), "%.0Fus/D", s->time_per_div_s * 1e6f);
 
     char l2[160];
     snprintf(l2, sizeof(l2),
@@ -1914,7 +1910,7 @@ static void skope_draw_help(skope_t *s) {
     "F1-F5  TRIG SOURCE",
     "UP/DN  TRIG LEVEL",
     "A      REARM SINGLE",
-    "H      HOLDOFF +1MS",
+    "H      HOLDOFF +1ms",
   };
   static const char *col_b[] = {
     "-- TIMEBASE --",
@@ -1929,7 +1925,7 @@ static void skope_draw_help(skope_t *s) {
     "G      GRID",
     "D      HUD",
     "L      LIGHT/DARK",
-    "K      LCD/VECT/HERSH",
+    "K      LCD/ATARI",
     "R      RESET",
     "/      THIS HELP",
     "Q      QUIT",

@@ -130,7 +130,7 @@ cmake .. \
 | `Space`      | Pause / freeze acquisition               |
 | `G`          | Toggle grid                              |
 | `L`          | Toggle dark phosphor / light paper theme |
-| `K`          | Cycle LCD → vector → Hershey text        |
+| `K`          | Cycle LCD → Atari-vector-style text      |
 | `D`          | Toggle HUD / status bar                  |
 | `R`          | Reset all scales and positions           |
 | `/`          | Toggle keyboard help overlay             |

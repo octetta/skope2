@@ -174,16 +174,34 @@ static Font hd44780_font_load(int scale, int *cell_w_out, int *cell_h_out) {
         // Bit 4 = leftmost pixel
         int lit = (bits >> (4 - col)) & 1;
         if (!lit) continue;
-        // Scale up: write a scale×scale block
+        // Scale up as a soft phosphor dot rather than a perfect rectangle.
+        // On low-DPI displays this is still crisp, but the pixel no longer
+        // reads as a chunky UI block.
         for (int sy = 0; sy < scale; sy++) {
           for (int sx = 0; sx < scale; sx++) {
+            float dx = ((float)sx + 0.5f) / (float)scale - 0.5f;
+            float dy = ((float)sy + 0.5f) / (float)scale - 0.5f;
+            float d2 = dx * dx + dy * dy;
+            int alpha = 255;
+            if (scale <= 2) {
+              alpha = sy == 0 ? 245 : 170;
+              if (sx == 0) alpha -= 20;
+            } else if (d2 > 0.19f) {
+              alpha = 0;
+            } else if (d2 > 0.12f) {
+              alpha = 130;
+            } else if (d2 > 0.06f) {
+              alpha = 220;
+            }
+            if (sy == scale - 1) alpha = (int)((float)alpha * 0.82f);
+            if (alpha <= 0) continue;
             int px = gx + col * scale + sx;
             int py = row * scale + sy;
             int idx = (py * atlas_w + px) * 4;
             pixels[idx + 0] = 255; // R
             pixels[idx + 1] = 255; // G
             pixels[idx + 2] = 255; // B
-            pixels[idx + 3] = 255; // A
+            pixels[idx + 3] = (unsigned char)alpha; // A
           }
         }
       }
@@ -265,155 +283,6 @@ static inline void hd_draw_scaled(Font f, const char *txt,
                                    Color col) {
   float sz = (float)f.baseSize * scale_factor;
   DrawTextEx(f, txt, (Vector2){(float)x, (float)y}, sz, 0.0f, col);
-}
-
-// ---------------------------------------------------------------------------
-// Vector-stroke rendering mode
-//
-// Instead of treating each lit pixel as a filled square (the bitmap-atlas
-// path above), this walks the same ROM bit patterns at draw time and
-// connects adjacent lit pixels with line segments — horizontal runs,
-// vertical runs, and the two diagonal directions. This traces the strokes
-// the glyph was designed around rather than rendering it as a block grid,
-// giving a genuine "vector scope readout" look instead of an LCD look.
-//
-// This is drawn live with DrawLineEx, not baked into a texture, so it
-// costs more per character than the bitmap-atlas path. It's only used
-// when vector mode is toggled on, and only for on-screen UI text (never
-// for anything performance-sensitive like waveform sample loops), so the
-// added per-frame cost is bounded by how much text is on screen — a few
-// hundred characters at most, well within budget at 30fps.
-// ---------------------------------------------------------------------------
-
-// Returns 1 if the pixel at (col,row) is lit in the given glyph's bitmap.
-static inline int hd44780_pixel_lit(const uint8_t *glyph, int col, int row) {
-  if (col < 0 || col >= HD44780_GLYPH_W) return 0;
-  if (row < 0 || row >= HD44780_GLYPH_H) return 0;
-  return (glyph[row] >> (4 - col)) & 1;
-}
-
-// Draw one glyph as connected line strokes at (ox,oy), scaled by `scale`
-// (pixels per ROM cell — same convention as the bitmap path's cell size).
-// thick: line stroke thickness in pixels.
-static void hd44780_draw_glyph_vector(const uint8_t *glyph,
-                                       float ox, float oy,
-                                       float scale, float thick,
-                                       Color col) {
-  // Horizontal runs: for each row, connect contiguous lit pixels with one
-  // line segment per run rather than per-pixel-pair, so a 5-pixel-wide
-  // lit run becomes one line, not four overlapping ones.
-  for (int row = 0; row < HD44780_GLYPH_H; row++) {
-    int run_start = -1;
-    for (int c = 0; c <= HD44780_GLYPH_W; c++) {
-      int lit = (c < HD44780_GLYPH_W) && hd44780_pixel_lit(glyph, c, row);
-      if (lit && run_start < 0) {
-        run_start = c;
-      } else if (!lit && run_start >= 0) {
-        int run_end = c - 1;
-        if (run_end > run_start) {
-          // Multi-pixel run: draw a single horizontal stroke through it.
-          Vector2 p0 = {ox + run_start * scale + scale*0.5f, oy + row*scale + scale*0.5f};
-          Vector2 p1 = {ox + run_end   * scale + scale*0.5f, oy + row*scale + scale*0.5f};
-          DrawLineEx(p0, p1, thick, col);
-        } else {
-          // Single isolated pixel: draw a short dot-stroke (tiny line so
-          // it still renders at any thickness).
-          Vector2 p0 = {ox + run_start*scale + scale*0.5f, oy + row*scale + scale*0.5f};
-          Vector2 p1 = {p0.x + 0.01f, p0.y};
-          DrawLineEx(p0, p1, thick, col);
-        }
-        run_start = -1;
-      }
-    }
-  }
-
-  // Vertical runs: same idea, column-wise. This is what gives strokes
-  // like the spine of 'L' or the stem of 'T' a clean single line instead
-  // of being implied only by stacked horizontal dots.
-  for (int c = 0; c < HD44780_GLYPH_W; c++) {
-    int run_start = -1;
-    for (int row = 0; row <= HD44780_GLYPH_H; row++) {
-      int lit = (row < HD44780_GLYPH_H) && hd44780_pixel_lit(glyph, c, row);
-      if (lit && run_start < 0) {
-        run_start = row;
-      } else if (!lit && run_start >= 0) {
-        int run_end = row - 1;
-        if (run_end > run_start) {
-          Vector2 p0 = {ox + c*scale + scale*0.5f, oy + run_start*scale + scale*0.5f};
-          Vector2 p1 = {ox + c*scale + scale*0.5f, oy + run_end  *scale + scale*0.5f};
-          DrawLineEx(p0, p1, thick, col);
-        }
-        // Single-pixel runs already drawn by the horizontal pass above —
-        // skip here to avoid doubling the stroke on isolated pixels.
-        run_start = -1;
-      }
-    }
-  }
-
-  // Diagonal connectors: catches strokes like the legs of 'X', 'K', 'Y'
-  // that the horizontal/vertical passes alone leave looking disconnected
-  // (a staircase of isolated pixels). For each lit pixel, if its
-  // down-right or down-left neighbour is lit AND neither of the
-  // "straight" neighbours that would normally connect them is lit,
-  // draw the diagonal segment.
-  for (int row = 0; row < HD44780_GLYPH_H - 1; row++) {
-    for (int c = 0; c < HD44780_GLYPH_W; c++) {
-      if (!hd44780_pixel_lit(glyph, c, row)) continue;
-
-      // Down-right diagonal
-      if (c+1 < HD44780_GLYPH_W && hd44780_pixel_lit(glyph, c+1, row+1)) {
-        int straight_blocked =
-          hd44780_pixel_lit(glyph, c+1, row) || hd44780_pixel_lit(glyph, c, row+1);
-        if (!straight_blocked) {
-          Vector2 p0 = {ox + c*scale     + scale*0.5f, oy + row*scale     + scale*0.5f};
-          Vector2 p1 = {ox + (c+1)*scale + scale*0.5f, oy + (row+1)*scale + scale*0.5f};
-          DrawLineEx(p0, p1, thick, col);
-        }
-      }
-      // Down-left diagonal
-      if (c-1 >= 0 && hd44780_pixel_lit(glyph, c-1, row+1)) {
-        int straight_blocked =
-          hd44780_pixel_lit(glyph, c-1, row) || hd44780_pixel_lit(glyph, c, row+1);
-        if (!straight_blocked) {
-          Vector2 p0 = {ox + c*scale     + scale*0.5f, oy + row*scale     + scale*0.5f};
-          Vector2 p1 = {ox + (c-1)*scale + scale*0.5f, oy + (row+1)*scale + scale*0.5f};
-          DrawLineEx(p0, p1, thick, col);
-        }
-      }
-    }
-  }
-}
-
-// Draw a full string in vector-stroke mode. cell_w/cell_h match the
-// bitmap path's cell size convention (HD44780_CELL_W/H * scale_factor)
-// so vector and bitmap text line up identically when swapped.
-static void hd44780_draw_text_vector(const char *txt, int x, int y,
-                                      int cell_w, int cell_h,
-                                      Color col) {
-  if (!txt) return;
-  // scale = pixels per ROM grid cell (glyph is 5 wide / 8 tall within
-  // the cell_w-1 x cell_h-1 drawable area, matching the bitmap path's
-  // 1px gap convention).
-  float scale = (float)cell_h / (float)HD44780_GLYPH_H;
-  float thick = scale * 0.55f;  // stroke thickness relative to pixel pitch
-  if (thick < 1.0f) thick = 1.0f;
-
-  float cx = (float)x;
-  for (const unsigned char *p = (const unsigned char *)txt; *p; p++) {
-    if (*p == ' ') { cx += cell_w; continue; }
-    if (*p < HD44780_FIRST || *p > HD44780_LAST) { cx += cell_w; continue; }
-    const uint8_t *glyph = kHD44780Rom[*p - HD44780_FIRST];
-    hd44780_draw_glyph_vector(glyph, cx, (float)y, scale, thick, col);
-    cx += cell_w;
-  }
-}
-
-// Measure a vector-mode string — same advance width as the bitmap path
-// (one cell_w per character), so layout code doesn't need to know which
-// mode is active.
-static inline int hd44780_measure_vector(const char *txt, int cell_w) {
-  if (!txt) return 0;
-  return (int)strlen(txt) * cell_w;
 }
 
 #endif /* HD44780_FONT_H */

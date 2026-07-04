@@ -652,6 +652,12 @@ static int skope_poll(skope_t *s) {
 
   if (!s->reader.header) { skope_disconnect(s); return 0; }
 
+  if (shm_load64(&s->reader.header->active) == 0) {
+    skope_disconnect(s);
+    s->last_connect_attempt = -1e9;
+    return 0;
+  }
+
   uint64_t gen = s->reader.header->generation;
   if (gen != s->last_generation) {
     skope_disconnect(s);

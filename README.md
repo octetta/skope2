@@ -10,7 +10,9 @@ skope [shm-name]
 ```
 
 Defaults: `shm-name = skred-scope`. The app reconnects automatically while it
-waits for skred to publish the shared-memory scope buffer.
+waits for skred to publish the shared-memory scope buffer. On Windows the name
+is mapped into the current user's `Local\\` object namespace; pass the same
+plain name to both programs.
 
 ---
 
@@ -230,7 +232,8 @@ skope/
 ## Updating scope-ipc from skred
 
 The `src/scope-ipc.*` files are direct copies from the skred source tree.
-When skred's IPC format changes (new magic, version bump, header layout
+They support POSIX shared memory and Windows named file mappings. When
+skred's IPC format changes (new magic, version bump, header layout
 change), copy the new files over and rebuild. The `_Static_assert` checks
 in `scope-ipc.h` will catch layout mismatches at compile time before any
 misreads can occur at runtime.

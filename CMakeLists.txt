@@ -106,8 +106,10 @@ else()
   )
 endif()
 
-# scope-ipc.c uses ftruncate, shm_open, nanosleep etc — needs POSIX 2008
-target_compile_definitions(skope PRIVATE _POSIX_C_SOURCE=200809L)
+# The Unix scope transport uses the POSIX shared-memory APIs.
+if(NOT WIN32)
+  target_compile_definitions(skope PRIVATE _POSIX_C_SOURCE=200809L)
+endif()
 
 # ---------------------------------------------------------------------------
 # Link raylib and platform deps

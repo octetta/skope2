@@ -41,7 +41,11 @@ _Static_assert(offsetof(skred_scope_header_t, sequence) == 48,
                "scope IPC sequence offset changed");
 
 typedef struct {
+#if defined(_WIN32) || defined(_WIN64)
+  void *mapping_handle;
+#else
   int fd;
+#endif
   size_t mapping_bytes;
   const skred_scope_header_t *header;
   const float *frames;

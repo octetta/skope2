@@ -1,15 +1,19 @@
 #include "scope-ipc.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <math.h>
-#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32) || defined(_WIN64)
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include "portable_atomic.h"
 
@@ -17,7 +21,11 @@
 
 typedef struct {
   int initialized;
+#if defined(_WIN32) || defined(_WIN64)
+  HANDLE mapping_handle;
+#else
   int fd;
+#endif
   int sample_rate;
   int scratch_frames;
   size_t mapping_bytes;
@@ -34,7 +42,11 @@ typedef struct {
   char track_name[SKRED_SCOPE_TRACK_COUNT][SKRED_SCOPE_TRACK_NAME_MAX];
 } scope_ipc_t;
 
-static scope_ipc_t scope_ipc = {.fd = -1};
+static scope_ipc_t scope_ipc = {
+#if !defined(_WIN32) && !defined(_WIN64)
+  .fd = -1
+#endif
+};
 static uint64_t scope_generation;
 
 static uint64_t scope_atomic_load(const volatile uint64_t *value);
@@ -46,15 +58,30 @@ static void scope_ipc_stop_locked(void) {
   int expected = 0;
   while (!atomic_compare_exchange_int(&scope_ipc.producer_lock, &expected, 1)) {
     expected = 0;
+#if defined(_WIN32) || defined(_WIN64)
+    SwitchToThread();
+#else
     sched_yield();
+#endif
   }
   atomic_store_int(&scope_ipc.enabled, 0);
   if (scope_ipc.header) scope_atomic_store(&scope_ipc.header->active, 0);
-  if (scope_ipc.header && scope_ipc.mapping_bytes)
+  if (scope_ipc.header && scope_ipc.mapping_bytes) {
+#if defined(_WIN32) || defined(_WIN64)
+    UnmapViewOfFile(scope_ipc.header);
+#else
     munmap(scope_ipc.header, scope_ipc.mapping_bytes);
+#endif
+  }
+#if !defined(_WIN32) && !defined(_WIN64)
   if (scope_ipc.fd >= 0) close(scope_ipc.fd);
   if (scope_ipc.name[0]) shm_unlink(scope_ipc.name);
   scope_ipc.fd = -1;
+#endif
+#if defined(_WIN32) || defined(_WIN64)
+  if (scope_ipc.mapping_handle) CloseHandle(scope_ipc.mapping_handle);
+  scope_ipc.mapping_handle = NULL;
+#endif
   scope_ipc.mapping_bytes = 0;
   scope_ipc.header = NULL;
   scope_ipc.frames = NULL;
@@ -63,7 +90,12 @@ static void scope_ipc_stop_locked(void) {
 }
 
 static uint64_t scope_atomic_load(const volatile uint64_t *value) {
-#if defined(_WIN32) || defined(_WIN64)
+#if defined(_WIN64)
+  MemoryBarrier();
+  uint64_t result = *value;
+  MemoryBarrier();
+  return result;
+#elif defined(_WIN32)
   return atomic_load_uint64((atomic_uint64_t *)value);
 #else
   return __atomic_load_n(value, __ATOMIC_ACQUIRE);
@@ -81,6 +113,12 @@ static void scope_atomic_store(volatile uint64_t *value, uint64_t next) {
 static int scope_canonical_name(const char *name, char *output,
                                 size_t output_size) {
   if (!name || !name[0] || !output || output_size < 2) return -1;
+#if defined(_WIN32) || defined(_WIN64)
+  while (*name == '/') name++;
+  if (!name[0] || strchr(name, '/') || strchr(name, '\\')) return -1;
+  int written = snprintf(output, output_size, "Local\\%s", name);
+  if (written < 0 || (size_t)written >= output_size) return -1;
+#else
   int written = name[0] == '/'
     ? snprintf(output, output_size, "%s", name)
     : snprintf(output, output_size, "/%s", name);
@@ -88,6 +126,7 @@ static int scope_canonical_name(const char *name, char *output,
   for (int i = 1; output[i]; i++) {
     if (output[i] == '/') return -1;
   }
+#endif
   return 0;
 }
 
@@ -153,7 +192,9 @@ void scope_ipc_uninit(void) {
   simple_mutex_destroy(&scope_ipc.lifecycle_mutex);
   free(scope_ipc.scratch);
   memset(&scope_ipc, 0, sizeof(scope_ipc));
+#if !defined(_WIN32) && !defined(_WIN64)
   scope_ipc.fd = -1;
+#endif
 }
 
 int scope_ipc_start(const char *name, uint32_t channel_mask,
@@ -174,6 +215,41 @@ int scope_ipc_start(const char *name, uint32_t channel_mask,
 
   simple_mutex_lock(&scope_ipc.lifecycle_mutex);
   scope_ipc_stop_locked();
+#if defined(_WIN32) || defined(_WIN64)
+  HANDLE mapping_handle = NULL;
+  for (int attempt = 0; attempt < 100; attempt++) {
+    SetLastError(ERROR_SUCCESS);
+    mapping_handle = CreateFileMappingA(
+      INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+      (DWORD)(((uint64_t)mapping_bytes) >> 32),
+      (DWORD)((uint64_t)mapping_bytes & UINT32_MAX), canonical);
+    if (!mapping_handle) break;
+    if (GetLastError() != ERROR_ALREADY_EXISTS) break;
+    const skred_scope_header_t *existing = MapViewOfFile(
+      mapping_handle, FILE_MAP_READ, 0, 0, sizeof(skred_scope_header_t));
+    int reusable = existing &&
+      existing->magic == SKRED_SCOPE_MAGIC &&
+      existing->version == SKRED_SCOPE_VERSION &&
+      scope_mapping_bytes(existing->capacity_frames,
+                          existing->channel_count) == mapping_bytes;
+    if (existing) UnmapViewOfFile(existing);
+    if (reusable) break;
+    CloseHandle(mapping_handle);
+    mapping_handle = NULL;
+    Sleep(10);
+  }
+  if (!mapping_handle) {
+    simple_mutex_unlock(&scope_ipc.lifecycle_mutex);
+    return -1;
+  }
+  void *mapping = MapViewOfFile(mapping_handle, FILE_MAP_ALL_ACCESS,
+                                0, 0, mapping_bytes);
+  if (!mapping) {
+    CloseHandle(mapping_handle);
+    simple_mutex_unlock(&scope_ipc.lifecycle_mutex);
+    return -1;
+  }
+#else
   shm_unlink(canonical);
   int fd = shm_open(canonical, O_CREAT | O_EXCL | O_RDWR, 0600);
   if (fd < 0) {
@@ -194,9 +270,14 @@ int scope_ipc_start(const char *name, uint32_t channel_mask,
     simple_mutex_unlock(&scope_ipc.lifecycle_mutex);
     return -1;
   }
+#endif
 
   memset(mapping, 0, mapping_bytes);
+#if defined(_WIN32) || defined(_WIN64)
+  scope_ipc.mapping_handle = mapping_handle;
+#else
   scope_ipc.fd = fd;
+#endif
   scope_ipc.mapping_bytes = mapping_bytes;
   scope_ipc.header = mapping;
   scope_ipc.frames = (float *)(scope_ipc.header + 1);
@@ -320,9 +401,46 @@ void scope_ipc_publish(const float *frames, int frame_count) {
 int scope_ipc_reader_open(skred_scope_reader_t *reader, const char *name) {
   if (!reader) return -1;
   memset(reader, 0, sizeof(*reader));
+#if !defined(_WIN32) && !defined(_WIN64)
   reader->fd = -1;
+#endif
   if (scope_canonical_name(name, reader->name, sizeof(reader->name)) != 0)
     return -1;
+#if defined(_WIN32) || defined(_WIN64)
+  reader->mapping_handle = OpenFileMappingA(FILE_MAP_READ, FALSE, reader->name);
+  if (!reader->mapping_handle) return -1;
+  const skred_scope_header_t *probe = MapViewOfFile(
+    (HANDLE)reader->mapping_handle, FILE_MAP_READ, 0, 0,
+    sizeof(skred_scope_header_t));
+  if (!probe) {
+    scope_ipc_reader_close(reader);
+    return -1;
+  }
+  if (probe->magic != SKRED_SCOPE_MAGIC ||
+      probe->version != SKRED_SCOPE_VERSION ||
+      probe->header_bytes != sizeof(*probe) ||
+      probe->channel_count != SKRED_SCOPE_CHANNELS ||
+      probe->track_count != SKRED_SCOPE_TRACK_COUNT ||
+      probe->track_name_bytes != SKRED_SCOPE_TRACK_NAME_MAX) {
+    UnmapViewOfFile(probe);
+    scope_ipc_reader_close(reader);
+    return -1;
+  }
+  reader->mapping_bytes = scope_mapping_bytes(probe->capacity_frames,
+                                               probe->channel_count);
+  UnmapViewOfFile(probe);
+  if (!reader->mapping_bytes) {
+    scope_ipc_reader_close(reader);
+    return -1;
+  }
+  reader->header = MapViewOfFile((HANDLE)reader->mapping_handle,
+                                 FILE_MAP_READ, 0, 0,
+                                 reader->mapping_bytes);
+  if (!reader->header) {
+    scope_ipc_reader_close(reader);
+    return -1;
+  }
+#else
   reader->fd = shm_open(reader->name, O_RDONLY, 0);
   if (reader->fd < 0) return -1;
   struct stat status;
@@ -340,6 +458,7 @@ int scope_ipc_reader_open(skred_scope_reader_t *reader, const char *name) {
     return -1;
   }
   reader->header = mapping;
+#endif
   if (reader->header->magic != SKRED_SCOPE_MAGIC ||
       reader->header->version != SKRED_SCOPE_VERSION ||
       reader->header->header_bytes != sizeof(*reader->header) ||
@@ -358,11 +477,18 @@ int scope_ipc_reader_open(skred_scope_reader_t *reader, const char *name) {
 
 void scope_ipc_reader_close(skred_scope_reader_t *reader) {
   if (!reader) return;
+#if defined(_WIN32) || defined(_WIN64)
+  if (reader->header) UnmapViewOfFile(reader->header);
+  if (reader->mapping_handle) CloseHandle((HANDLE)reader->mapping_handle);
+#else
   if (reader->header && reader->mapping_bytes)
     munmap((void *)reader->header, reader->mapping_bytes);
   if (reader->fd >= 0) close(reader->fd);
+#endif
   memset(reader, 0, sizeof(*reader));
+#if !defined(_WIN32) && !defined(_WIN64)
   reader->fd = -1;
+#endif
 }
 
 int scope_ipc_reader_latest(const skred_scope_reader_t *reader, float *output,

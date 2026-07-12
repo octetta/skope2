@@ -50,7 +50,7 @@ RECORD_CHANNELS = RECORD_TRACK_COUNT * AUDIO_CHANNELS = 5 * 2 = 10
 raylib is fetched automatically from GitHub by CMake (tag 5.5) unless you
 have a system installation.
 
-### Quick build (Linux / macOS)
+### Quick build (Linux)
 
 ```sh
 mkdir build && cd build
@@ -58,6 +58,25 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . -j$(nproc)
 ./skope
 ```
+
+### macOS application bundle
+
+```sh
+cmake -S . -B build-macos -DCMAKE_BUILD_TYPE=Release
+cmake --build build-macos --config Release
+open build-macos/skope.app
+```
+
+To install into a staging prefix or create a drag-and-drop DMG:
+
+```sh
+cmake --install build-macos --prefix stage
+cmake --build build-macos --target package
+```
+
+The bundle identifier is `org.skred.skope`. The generated app is unsigned;
+release distribution can apply the project owner's Developer ID signature and
+notarization after packaging.
 
 ### Windows (MSVC)
 

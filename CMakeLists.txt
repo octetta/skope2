@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(skope C)
+project(skope VERSION 0.1.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -84,7 +84,11 @@ else()
   list(APPEND SKOPE_SOURCES src/scope-ipc.c)
 endif()
 
-add_executable(skope ${SKOPE_SOURCES})
+if(APPLE)
+  add_executable(skope MACOSX_BUNDLE ${SKOPE_SOURCES})
+else()
+  add_executable(skope ${SKOPE_SOURCES})
+endif()
 
 # ---------------------------------------------------------------------------
 # Include paths
@@ -173,12 +177,20 @@ if(WIN32)
 endif()
 
 # ---------------------------------------------------------------------------
-# macOS: set High Resolution capable in Info.plist (for bundled apps)
+# macOS application bundle
 # ---------------------------------------------------------------------------
 
 if(APPLE)
   set_target_properties(skope PROPERTIES
-    MACOSX_BUNDLE FALSE
+    MACOSX_BUNDLE TRUE
+    MACOSX_BUNDLE_BUNDLE_NAME "skope"
+    MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "org.skred.skope"
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Info.plist.in"
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "@executable_path/../Frameworks"
+    XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "org.skred.skope"
   )
 endif()
 
@@ -186,7 +198,20 @@ endif()
 # Install
 # ---------------------------------------------------------------------------
 
-install(TARGETS skope RUNTIME DESTINATION bin)
+if(APPLE)
+  install(TARGETS skope BUNDLE DESTINATION .)
+else()
+  install(TARGETS skope RUNTIME DESTINATION bin)
+endif()
+
+set(CPACK_PACKAGE_NAME "skope")
+set(CPACK_PACKAGE_VENDOR "skred")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_FILE_NAME "skope-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}")
+if(APPLE)
+  set(CPACK_GENERATOR "DragNDrop")
+endif()
+include(CPack)
 
 # ---------------------------------------------------------------------------
 # Summary

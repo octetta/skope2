@@ -497,16 +497,32 @@ static uint64_t shm_load64(const volatile uint64_t *v) {
 
 static int skope_ensure_sample_capacity(skope_t *s, uint32_t frames) {
   if (frames <= s->sample_capacity) return 1;
-  float *scratch = realloc(s->scratch,
-                           (size_t)frames * RECORD_CHANNELS * sizeof(float));
-  if (!scratch) return 0;
-  s->scratch = scratch;
 
+  float *new_scratch = realloc(s->scratch,
+                               (size_t)frames * RECORD_CHANNELS * sizeof(float));
+  if (!new_scratch) return 0;
+  
+  float *new_history[SKOPE_TRACE_HISTORY];
   for (int i = 0; i < SKOPE_TRACE_HISTORY; i++) {
-    float *samples = realloc(s->history[i].samples,
+    new_history[i] = realloc(s->history[i].samples,
                              (size_t)frames * RECORD_CHANNELS * sizeof(float));
-    if (!samples) return 0;
-    s->history[i].samples = samples;
+    if (!new_history[i]) {
+      // On failure, we've already realloc'd some buffers to larger sizes, but
+      // we haven't updated sample_capacity. This is safe, as realloc leaves
+      // the original pointer valid (or replaces it with a larger block). 
+      // We must just ensure we don't lose the pointers that did succeed.
+      s->scratch = new_scratch;
+      for (int j = 0; j < i; j++) {
+        s->history[j].samples = new_history[j];
+      }
+      return 0;
+    }
+  }
+
+  // All reallocs succeeded, update all pointers and capacity safely.
+  s->scratch = new_scratch;
+  for (int i = 0; i < SKOPE_TRACE_HISTORY; i++) {
+    s->history[i].samples = new_history[i];
   }
   s->sample_capacity = frames;
   return 1;
@@ -784,7 +800,8 @@ static int skope_handle_input(skope_t *s) {
     static double last_pos_t = 0;
     double now_pos = skope_now();
     float dt = (float)(now_pos - last_pos_t);
-    if (dt > 0.1f) dt = 0.1f;  // clamp for first call
+    if (last_pos_t == 0) dt = 0.0f;
+    if (dt > 0.1f) dt = 0.1f;
     last_pos_t = now_pos;
     float pos_step = dt * 4.0f;
     if (IsKeyDown(KEY_COMMA))  { s->pairs[s->selected_pair].offset_div -= pos_step; changed = 1; }
@@ -811,10 +828,17 @@ static int skope_handle_input(skope_t *s) {
 
   // Trigger level: UP/DOWN (held keys — already counted in `held` above)
   {
+    static double last_trig_t = 0;
+    double now_trig = skope_now();
+    float dt = (float)(now_trig - last_trig_t);
+    if (last_trig_t == 0) dt = 0.0f;
+    if (dt > 0.1f) dt = 0.1f;
+    last_trig_t = now_trig;
+
     float lstep = (IsKeyDown(KEY_LEFT_SHIFT)||IsKeyDown(KEY_RIGHT_SHIFT))
-      ? 0.05f : 0.01f;
-    if (IsKeyDown(KEY_UP))   s->trig_level += lstep;
-    if (IsKeyDown(KEY_DOWN)) s->trig_level -= lstep;
+      ? 1.0f : 0.2f;
+    if (IsKeyDown(KEY_UP))   { s->trig_level += lstep * dt; changed = 1; }
+    if (IsKeyDown(KEY_DOWN)) { s->trig_level -= lstep * dt; changed = 1; }
     if (s->trig_level >  2.f) s->trig_level =  2.f;
     if (s->trig_level < -2.f) s->trig_level = -2.f;
   }

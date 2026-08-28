@@ -167,6 +167,7 @@ typedef enum {
   VIEW_STACKED = 0,   // one band per pair, L/R with stereo fill
   VIEW_OVERLAY,       // all pairs on one grid
   VIEW_LISSAJOUS,     // X-Y phase scope, grid of pairs
+  VIEW_LISSAJOUS_ROT, // X-Y phase scope, slowly rotating
   VIEW_COUNT
 } view_mode_t;
 
@@ -1349,7 +1350,7 @@ static void skope_draw_overlay(skope_t *s, const trace_t *t,
 
 // Draw one X-Y phase plot for pair p into cell.
 static void draw_lissajous_cell(skope_t *s, const trace_t *t,
-                                 Rectangle cell, int p, float alpha) {
+                                 Rectangle cell, int p, float alpha, float rot) {
   int win   = frames_for_window(s, t->frame_count);
   int start = t->frame_count - win;
   if (start < 0) start = 0;
@@ -1364,6 +1365,8 @@ static void draw_lissajous_cell(skope_t *s, const trace_t *t,
   float cx = cell.x + cell.width  / 2.0f;
   float cy = cell.y + cell.height / 2.0f;
 
+  float rc = cosf(rot), rs = sinf(rot);
+
   Color col  = color_alpha(kPairColor[p], alpha * 0.85f);
   Color dotc = color_alpha(kPairColor[p], alpha);
   float lw   = fmaxf(1.0f, s->dpi_y);
@@ -1373,7 +1376,9 @@ static void draw_lissajous_cell(skope_t *s, const trace_t *t,
     int si = start + i;
     float l = t->samples[(size_t)si * RECORD_CHANNELS + chl];
     float r = t->samples[(size_t)si * RECORD_CHANNELS + chr];
-    Vector2 cur = {cx + l * scale, cy - r * scale};
+    float rl = l * rc - r * rs;
+    float rr = l * rs + r * rc;
+    Vector2 cur = {cx + rl * scale, cy - rr * scale};
     // Clip to cell
     float cl = cell.x, cr2 = cell.x+cell.width;
     float ct = cell.y, cb  = cell.y+cell.height;
@@ -1387,7 +1392,9 @@ static void draw_lissajous_cell(skope_t *s, const trace_t *t,
     int si = start + count - 1;
     float l = t->samples[(size_t)si * RECORD_CHANNELS + chl];
     float r = t->samples[(size_t)si * RECORD_CHANNELS + chr];
-    Vector2 dot = {cx + l * scale, cy - r * scale};
+    float rl = l * rc - r * rs;
+    float rr = l * rs + r * rc;
+    Vector2 dot = {cx + rl * scale, cy - rr * scale};
     DrawCircleV(dot, 2.5f * s->dpi_x, dotc);
   }
 
@@ -1429,6 +1436,12 @@ static void skope_draw_lissajous(skope_t *s, const trace_t *t,
                                   Rectangle plot, float alpha) {
   if (!t->valid || t->frame_count < 2) return;
 
+  float rot = 0.0f;
+  if (s->view_mode == VIEW_LISSAJOUS_ROT) {
+    float speed = 0.4f; // radians/sec — tweak to taste
+    rot = fmodf((float)skope_now() * speed, 2.0f * PI);
+  }
+
   int active = 0;
   for (int p = 0; p < SKOPE_NUM_PAIRS; p++) if (s->pairs[p].enabled) active++;
   if (!active) return;
@@ -1468,7 +1481,7 @@ static void skope_draw_lissajous(skope_t *s, const trace_t *t,
 
     if (s->show_grid) skope_draw_grid(cell, 8, 8, s->dpi_y, s->theme);
 
-    draw_lissajous_cell(s, t, cell, p, alpha);
+    draw_lissajous_cell(s, t, cell, p, alpha, rot);
 
     col++;
     if (col >= cols) { col = 0; row++; }
@@ -1481,9 +1494,10 @@ static void skope_draw_lissajous(skope_t *s, const trace_t *t,
 
 static const char *view_name(view_mode_t v) {
   switch(v) {
-    case VIEW_STACKED:   return "STACKED";
-    case VIEW_OVERLAY:   return "OVERLAY";
-    case VIEW_LISSAJOUS: return "LISSAJOUS";
+    case VIEW_STACKED:       return "STACKED";
+    case VIEW_OVERLAY:       return "OVERLAY";
+    case VIEW_LISSAJOUS:     return "LISSAJOUS";
+    case VIEW_LISSAJOUS_ROT: return "LISSAJOUS-ROT";
     default: return "?";
   }
 }
@@ -1856,7 +1870,8 @@ static void skope_draw_hud(skope_t *s, float hud_y, float hud_h) {
   const char *tmode_str = s->trig_mode == TRIG_AUTO   ? "AUTO"
                         : s->trig_mode == TRIG_NORMAL ? "NORM" : "SNGL";
   const char *view_str  = s->view_mode == VIEW_STACKED   ? "STKD"
-                        : s->view_mode == VIEW_OVERLAY   ? "OVLY" : "X-Y";
+                        : s->view_mode == VIEW_OVERLAY   ? "OVLY"
+                        : s->view_mode == VIEW_LISSAJOUS ? "X-Y" : "X-Y*";
 
   sk_t keys[] = {
     { tmode_str,                              "T",   1               },

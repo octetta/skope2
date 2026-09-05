@@ -643,6 +643,41 @@ static void skope_sleep(double sec) {
 // Poll / acquire
 // ---------------------------------------------------------------------------
 
+static int skope_find_auto_sync(skope_t *s, const float *samples, int frames, int *out_idx, float *out_fract) {
+  if (frames < 2) return 0;
+  int ch = s->trig_pair * 2;
+  float max_slope = 0.0f;
+  int best_idx = -1;
+  float best_fract = 0.0f;
+  
+  float max_val = 0.0f;
+  for (int i = 0; i < frames; i++) {
+      float v = fabsf(samples[(size_t)i * RECORD_CHANNELS + ch]);
+      if (v > max_val) max_val = v;
+  }
+  if (max_val < 0.001f) return 0;
+  
+  for (int i = 1; i < frames; i++) {
+      float prev = samples[(size_t)(i-1) * RECORD_CHANNELS + ch];
+      float cur  = samples[(size_t)i     * RECORD_CHANNELS + ch];
+      if (prev <= 0.0f && cur >= 0.0f) {
+          float slope = cur - prev;
+          if (slope > max_slope) {
+              max_slope = slope;
+              best_idx = i;
+              best_fract = (0.0f - prev) / (slope + 1e-6f);
+          }
+      }
+  }
+  
+  if (best_idx > 0) {
+      if (out_idx) *out_idx = best_idx;
+      if (out_fract) *out_fract = best_fract;
+      return 1;
+  }
+  return 0;
+}
+
 static int skope_find_trigger(skope_t *s, const float *samples,
                                int frames, int *out_idx, float *out_fract) {
   if (frames < 2) return 0;
@@ -720,7 +755,13 @@ static int skope_poll(skope_t *s) {
   // user scrolls back, the visible window is treated as a memory view.
   int trig_idx = 0;
   float trig_fract = 0.0f;
-  int have_trig = skope_find_trigger(s, s->scratch, count, &trig_idx, &trig_fract);
+  int have_trig = 0;
+  
+  if (s->trig_mode == TRIG_AUTO) {
+      have_trig = skope_find_auto_sync(s, s->scratch, count, &trig_idx, &trig_fract);
+  } else {
+      have_trig = skope_find_trigger(s, s->scratch, count, &trig_idx, &trig_fract);
+  }
 
   if (s->view_offset_frames == 0 &&
       (s->trig_mode == TRIG_NORMAL || s->trig_mode == TRIG_SINGLE)) {
@@ -732,9 +773,7 @@ static int skope_poll(skope_t *s) {
   }
 
   int src_offset = 0;
-  if (s->view_offset_frames == 0 &&
-      (s->trig_mode == TRIG_NORMAL || s->trig_mode == TRIG_SINGLE)
-      && have_trig) {
+  if (s->view_offset_frames == 0 && have_trig) {
     int lead = count / 3;
     src_offset = trig_idx - lead;
     if (src_offset < 0) src_offset = 0;
@@ -1175,7 +1214,7 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
 
   int win = frames_for_window(s, t->frame_count);
   int start = t->frame_count - win;
-  if (s->trig_mode != TRIG_AUTO) {
+  if (s->trig_mode != TRIG_AUTO || t->trig_idx > 0) {
       // Anchor trigger at 2 divisions from the left (out of 10 divs total = 20%)
       start = t->trig_idx - (int)(0.2f * win);
   }
@@ -1328,7 +1367,7 @@ static void skope_draw_overlay(skope_t *s, const trace_t *t,
 
   int win   = frames_for_window(s, t->frame_count);
   int start = t->frame_count - win;
-  if (s->trig_mode != TRIG_AUTO) {
+  if (s->trig_mode != TRIG_AUTO || t->trig_idx > 0) {
       // Anchor trigger at 2 divisions from the left (out of 10 divs total = 20%)
       start = t->trig_idx - (int)(0.2f * win);
   }
@@ -1372,7 +1411,7 @@ static void draw_lissajous_cell(skope_t *s, const trace_t *t,
                                  Rectangle cell, int p, float alpha, float rot) {
   int win   = frames_for_window(s, t->frame_count);
   int start = t->frame_count - win;
-  if (s->trig_mode != TRIG_AUTO) {
+  if (s->trig_mode != TRIG_AUTO || t->trig_idx > 0) {
       // Anchor trigger at 2 divisions from the left (out of 10 divs total = 20%)
       start = t->trig_idx - (int)(0.2f * win);
   }

@@ -747,12 +747,17 @@ static int skope_poll(skope_t *s) {
   if (s->view_offset_frames > max_offset)
     s->view_offset_frames = max_offset;
 
+  // We need to capture more than 'win' frames so we have room to shift the window
+  // for trigger alignment. We grab win * 2 frames if possible.
+  uint32_t fetch = win * 2;
+  if (fetch > capacity) fetch = capacity;
+  
   uint64_t visible_end = wf - s->view_offset_frames;
-  if (visible_end < oldest + win) visible_end = oldest + win;
+  if (visible_end < oldest + fetch) visible_end = oldest + fetch;
   if (visible_end > wf) visible_end = wf;
-  uint64_t first = visible_end - win;
+  uint64_t first = visible_end - fetch;
 
-  int count = skope_reader_window(&s->reader, first, win, s->scratch);
+  int count = skope_reader_window(&s->reader, first, fetch, s->scratch);
   if (count <= 0) return 0;
 
   // Trigger alignment only applies to the live edge of the buffer. Once the
@@ -778,11 +783,15 @@ static int skope_poll(skope_t *s) {
 
   int src_offset = 0;
   if (s->view_offset_frames == 0 && have_trig) {
-    int lead = count / 3;
+    // Anchor trigger at 20% of the display window (0.2 * win)
+    int lead = (int)(0.2f * win);
     src_offset = trig_idx - lead;
     if (src_offset < 0) src_offset = 0;
   }
+  
+  // We only ever need to copy exactly 'win' frames to the trace
   int copy_count = count - src_offset;
+  if (copy_count > win) copy_count = win;
 
   int next = (s->history_head + 1) % SKOPE_TRACE_HISTORY;
   trace_t *dst = &s->history[next];

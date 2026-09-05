@@ -1112,7 +1112,7 @@ static void draw_corr_meter(Rectangle bar, float rho, Color col) {
 //   div_h:      pixels per division inside this band
 //   alpha:      overall opacity (for persistence layers)
 static void draw_pair_waveforms(Rectangle band,
-                                 const float *samples, int start, int count,
+                                 const float *samples, int start, int count, int win,
                                  int p, float vpd, float offset_div,
                                  float div_h, float alpha,
                                  float dpi_scale, float fract_offset) {
@@ -1141,8 +1141,8 @@ static void draw_pair_waveforms(Rectangle band,
     float fl1 = samples[(size_t)s1 * RECORD_CHANNELS + chl];
     float fr1 = samples[(size_t)s1 * RECORD_CHANNELS + chr];
 
-    float x0 = band.x + (band.width * ((float)i - fract_offset))     / (float)(n - 1);
-    float x1 = band.x + (band.width * ((float)(i+1) - fract_offset)) / (float)(n - 1);
+    float x0 = band.x + (band.width * ((float)i - fract_offset))     / (float)(win > 1 ? win - 1 : 1);
+    float x1 = band.x + (band.width * ((float)(i+1) - fract_offset)) / (float)(win > 1 ? win - 1 : 1);
 
     float yl0 = mid_y - off_px - (fl0 / vpd) * div_h;
     float yr0 = mid_y - off_px - (fr0 / vpd) * div_h;
@@ -1223,7 +1223,8 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
       start = t->trig_idx - (int)(0.2f * win);
   }
   if (start < 0) start = 0;
-  int count = t->frame_count - start;
+  int count = win;
+  if (start + count > t->frame_count) count = t->frame_count - start;
 
   float corr_bar_w = 12 * s->dpi_x;
   float usable_w   = plot.width - corr_bar_w - 2;
@@ -1248,7 +1249,7 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
     if (s->show_grid) skope_draw_grid(band, 10, 8, s->dpi_y, s->theme);
 
     float vpd = s->pairs[p].volts_per_div;
-    draw_pair_waveforms(band, t->samples, start, count,
+    draw_pair_waveforms(band, t->samples, start, count, win,
                         p, vpd, s->pairs[p].offset_div,
                         div_h, alpha, s->dpi_y, t->trig_fract);
 
@@ -1376,7 +1377,8 @@ static void skope_draw_overlay(skope_t *s, const trace_t *t,
       start = t->trig_idx - (int)(0.2f * win);
   }
   if (start < 0) start = 0;
-  int count = t->frame_count - start;
+  int count = win;
+  if (start + count > t->frame_count) count = t->frame_count - start;
 
   float div_h = plot.height / 8.0f;
 
@@ -1384,7 +1386,7 @@ static void skope_draw_overlay(skope_t *s, const trace_t *t,
     if (!s->pairs[p].enabled) continue;
     float vpd = s->pairs[p].volts_per_div;
     if (vpd < 1e-5f) vpd = 1e-5f;
-    draw_pair_waveforms(plot, t->samples, start, count,
+    draw_pair_waveforms(plot, t->samples, start, count, win,
                         p, vpd, s->pairs[p].offset_div,
                         div_h, alpha, s->dpi_y, t->trig_fract);
   }
@@ -1420,7 +1422,8 @@ static void draw_lissajous_cell(skope_t *s, const trace_t *t,
       start = t->trig_idx - (int)(0.2f * win);
   }
   if (start < 0) start = 0;
-  int count = t->frame_count - start;
+  int count = win;
+  if (start + count > t->frame_count) count = t->frame_count - start;
   if (count < 2) return;
 
   int chl = p * 2, chr = p * 2 + 1;

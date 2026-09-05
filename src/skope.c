@@ -204,6 +204,7 @@ typedef struct {
   uint64_t first_frame;
   double   captured_at;
   int      valid;
+  float    trig_fract;     // Fractional sample offset for anti-ghosting alignment
 } trace_t;
 
 // ---------------------------------------------------------------------------
@@ -332,7 +333,7 @@ static void   skope_draw_hud(skope_t *s, float hud_y, float hud_h);
 static void   skope_draw_help(skope_t *s);
 static void   skope_draw_buffer_overview(skope_t *s, Rectangle r);
 static int    skope_find_trigger(skope_t *s, const float *samples,
-                                  int frames, int *out_idx);
+                                  int frames, int *out_idx, float *out_fract);
 static int    skope_ensure_sample_capacity(skope_t *s, uint32_t frames);
 static int    skope_reader_window(const skred_scope_reader_t *reader,
                                   uint64_t first_frame, uint32_t count,
@@ -361,6 +362,9 @@ int main(int argc, char **argv) {
   InitWindow(s.base_width, s.base_height, "skope  |  octetta");
   SetWindowMinSize(520, 360);
   SetTargetFPS(0);  // disable raylib's internal frame throttle entirely
+  
+  // Enable MSAA 4X hint BEFORE init window? No, raylib requires ConfigFlags before InitWindow.
+  // Instead we just rely on our multi-pass analog glow which acts as antialiasing.
 
   Vector2 dpi = GetWindowScaleDPI();
   s.dpi_x = dpi.x > 0 ? dpi.x : 1.0f;
@@ -639,19 +643,21 @@ static void skope_sleep(double sec) {
 // ---------------------------------------------------------------------------
 
 static int skope_find_trigger(skope_t *s, const float *samples,
-                               int frames, int *out_idx) {
+                               int frames, int *out_idx, float *out_fract) {
   if (frames < 2) return 0;
   int ch = s->trig_pair * 2;   // L channel of trigger pair
   float level = s->trig_level;
   for (int i = 1; i < frames; i++) {
     float prev = samples[(size_t)(i-1) * RECORD_CHANNELS + ch];
     float cur  = samples[(size_t)i     * RECORD_CHANNELS + ch];
-    if (s->trig_edge == EDGE_RISING  && prev < level && cur >= level) {
+    if (s->trig_edge == EDGE_RISING  && prev <= level && cur >= level) {
       if (out_idx) *out_idx = i;
+      if (out_fract) *out_fract = (level - prev) / (cur - prev + 1e-6f);
       return 1;
     }
-    if (s->trig_edge == EDGE_FALLING && prev > level && cur <= level) {
+    if (s->trig_edge == EDGE_FALLING && prev >= level && cur <= level) {
       if (out_idx) *out_idx = i;
+      if (out_fract) *out_fract = (prev - level) / (prev - cur + 1e-6f);
       return 1;
     }
   }
@@ -712,7 +718,8 @@ static int skope_poll(skope_t *s) {
   // Trigger alignment only applies to the live edge of the buffer. Once the
   // user scrolls back, the visible window is treated as a memory view.
   int trig_idx = 0;
-  int have_trig = skope_find_trigger(s, s->scratch, count, &trig_idx);
+  float trig_fract = 0.0f;
+  int have_trig = skope_find_trigger(s, s->scratch, count, &trig_idx, &trig_fract);
 
   if (s->view_offset_frames == 0 &&
       (s->trig_mode == TRIG_NORMAL || s->trig_mode == TRIG_SINGLE)) {
@@ -744,6 +751,7 @@ static int skope_poll(skope_t *s) {
   dst->first_frame = first + (uint64_t)src_offset;
   dst->captured_at = now;
   dst->valid = 1;
+  dst->trig_fract = have_trig ? trig_fract : 0.0f;
 
   s->history_head = next;
   if (s->history_count < SKOPE_TRACE_HISTORY) s->history_count++;
@@ -1062,7 +1070,7 @@ static void draw_pair_waveforms(Rectangle band,
                                  const float *samples, int start, int count,
                                  int p, float vpd, float offset_div,
                                  float div_h, float alpha,
-                                 float dpi_scale) {
+                                 float dpi_scale, float fract_offset) {
   if (count < 2) return;
 
   int chl = p * 2;
@@ -1088,8 +1096,8 @@ static void draw_pair_waveforms(Rectangle band,
     float fl1 = samples[(size_t)s1 * RECORD_CHANNELS + chl];
     float fr1 = samples[(size_t)s1 * RECORD_CHANNELS + chr];
 
-    float x0 = band.x + (band.width * (float)i)     / (float)(n - 1);
-    float x1 = band.x + (band.width * (float)(i+1)) / (float)(n - 1);
+    float x0 = band.x + (band.width * ((float)i - fract_offset))     / (float)(n - 1);
+    float x1 = band.x + (band.width * ((float)(i+1) - fract_offset)) / (float)(n - 1);
 
     float yl0 = mid_y - off_px - (fl0 / vpd) * div_h;
     float yr0 = mid_y - off_px - (fr0 / vpd) * div_h;
@@ -1114,11 +1122,12 @@ static void draw_pair_waveforms(Rectangle band,
                    (Vector2){x0, yr0}, col_fill);
     }
 
-    // L waveform line
+    // Analog-style glow pass
+    DrawLineEx((Vector2){x0, yl0}, (Vector2){x1, yl1}, lw * 3.0f, color_alpha(col_l, alpha * 0.25f));
+    DrawLineEx((Vector2){x0, yr0}, (Vector2){x1, yr1}, fmaxf(1.0f, lw * 2.0f), color_alpha(col_r, alpha * 0.25f));
+    // Core line pass
     DrawLineEx((Vector2){x0, yl0}, (Vector2){x1, yl1}, lw, col_l);
-    // R waveform line (slightly thinner / dimmer to distinguish)
-    DrawLineEx((Vector2){x0, yr0}, (Vector2){x1, yr1},
-               fmaxf(1.0f, lw * 0.7f), col_r);
+    DrawLineEx((Vector2){x0, yr0}, (Vector2){x1, yr1}, fmaxf(1.0f, lw * 0.7f), col_r);
   }
 }
 
@@ -1192,7 +1201,7 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
     float vpd = s->pairs[p].volts_per_div;
     draw_pair_waveforms(band, t->samples, start, count,
                         p, vpd, s->pairs[p].offset_div,
-                        div_h, alpha, s->dpi_y);
+                        div_h, alpha, s->dpi_y, t->trig_fract);
 
     // --- Band labels and readout (Tek-style) --------------------------------
     // All spacing uses g_hd_cell_h (actual rendered glyph height) and
@@ -1324,7 +1333,7 @@ static void skope_draw_overlay(skope_t *s, const trace_t *t,
     if (vpd < 1e-5f) vpd = 1e-5f;
     draw_pair_waveforms(plot, t->samples, start, count,
                         p, vpd, s->pairs[p].offset_div,
-                        div_h, alpha, s->dpi_y);
+                        div_h, alpha, s->dpi_y, t->trig_fract);
   }
 
   // Trigger line — amber dashed horizontal + edge marker

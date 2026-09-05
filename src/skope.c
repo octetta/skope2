@@ -205,6 +205,7 @@ typedef struct {
   double   captured_at;
   int      valid;
   float    trig_fract;     // Fractional sample offset for anti-ghosting alignment
+  int      trig_idx;       // Index of trigger within this trace's samples
 } trace_t;
 
 // ---------------------------------------------------------------------------
@@ -752,6 +753,7 @@ static int skope_poll(skope_t *s) {
   dst->captured_at = now;
   dst->valid = 1;
   dst->trig_fract = have_trig ? trig_fract : 0.0f;
+  dst->trig_idx = have_trig ? (trig_idx - src_offset) : 0;
 
   s->history_head = next;
   if (s->history_count < SKOPE_TRACE_HISTORY) s->history_count++;
@@ -1173,6 +1175,10 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
 
   int win = frames_for_window(s, t->frame_count);
   int start = t->frame_count - win;
+  if (s->trig_mode != TRIG_AUTO) {
+      // Anchor trigger at 2 divisions from the left (out of 10 divs total = 20%)
+      start = t->trig_idx - (int)(0.2f * win);
+  }
   if (start < 0) start = 0;
   int count = t->frame_count - start;
 
@@ -1322,6 +1328,10 @@ static void skope_draw_overlay(skope_t *s, const trace_t *t,
 
   int win   = frames_for_window(s, t->frame_count);
   int start = t->frame_count - win;
+  if (s->trig_mode != TRIG_AUTO) {
+      // Anchor trigger at 2 divisions from the left (out of 10 divs total = 20%)
+      start = t->trig_idx - (int)(0.2f * win);
+  }
   if (start < 0) start = 0;
   int count = t->frame_count - start;
 
@@ -1362,6 +1372,10 @@ static void draw_lissajous_cell(skope_t *s, const trace_t *t,
                                  Rectangle cell, int p, float alpha, float rot) {
   int win   = frames_for_window(s, t->frame_count);
   int start = t->frame_count - win;
+  if (s->trig_mode != TRIG_AUTO) {
+      // Anchor trigger at 2 divisions from the left (out of 10 divs total = 20%)
+      start = t->trig_idx - (int)(0.2f * win);
+  }
   if (start < 0) start = 0;
   int count = t->frame_count - start;
   if (count < 2) return;

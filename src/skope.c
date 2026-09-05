@@ -657,7 +657,9 @@ static int skope_find_auto_sync(skope_t *s, const float *samples, int frames, in
   }
   if (max_val < 0.001f) return 0;
   
-  for (int i = 1; i < frames; i++) {
+  int search_start = frames / 3;
+  if (search_start < 1) search_start = 1;
+  for (int i = search_start; i < frames; i++) {
       float prev = samples[(size_t)(i-1) * RECORD_CHANNELS + ch];
       float cur  = samples[(size_t)i     * RECORD_CHANNELS + ch];
       if (prev <= 0.0f && cur >= 0.0f) {
@@ -683,7 +685,9 @@ static int skope_find_trigger(skope_t *s, const float *samples,
   if (frames < 2) return 0;
   int ch = s->trig_pair * 2;   // L channel of trigger pair
   float level = s->trig_level;
-  for (int i = 1; i < frames; i++) {
+  int search_start = frames / 3;
+  if (search_start < 1) search_start = 1;
+  for (int i = search_start; i < frames; i++) {
     float prev = samples[(size_t)(i-1) * RECORD_CHANNELS + ch];
     float cur  = samples[(size_t)i     * RECORD_CHANNELS + ch];
     if (s->trig_edge == EDGE_RISING  && prev <= level && cur >= level) {

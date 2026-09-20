@@ -1137,7 +1137,7 @@ static void draw_pair_waveforms(Rectangle band,
                                  int p, float vpd, float offset_div,
                                  float div_h, float alpha,
                                  float dpi_scale, float fract_offset) {
-  if (count < 2) return;
+  if (win < 2) return;
 
   int chl = p * 2;
   int chr = p * 2 + 1;
@@ -1154,13 +1154,18 @@ static void draw_pair_waveforms(Rectangle band,
   // To avoid per-pixel triangle calls, we use DrawTriangle for each pair
   // of adjacent frames. This gives a solid ribbon where the stereo spread
   // is immediately visible as the ribbon width.
-  int n = count;
+  int n = win;
   for (int i = 0; i < n - 1; i++) {
     int s0 = start + i, s1 = start + i + 1;
-    float fl0 = samples[(size_t)s0 * RECORD_CHANNELS + chl];
-    float fr0 = samples[(size_t)s0 * RECORD_CHANNELS + chr];
-    float fl1 = samples[(size_t)s1 * RECORD_CHANNELS + chl];
-    float fr1 = samples[(size_t)s1 * RECORD_CHANNELS + chr];
+    float fl0 = 0.0f, fr0 = 0.0f, fl1 = 0.0f, fr1 = 0.0f;
+    if (i < count) {
+      fl0 = samples[(size_t)s0 * RECORD_CHANNELS + chl];
+      fr0 = samples[(size_t)s0 * RECORD_CHANNELS + chr];
+    }
+    if (i + 1 < count) {
+      fl1 = samples[(size_t)s1 * RECORD_CHANNELS + chl];
+      fr1 = samples[(size_t)s1 * RECORD_CHANNELS + chr];
+    }
 
     float x0 = band.x + (band.width * ((float)i - fract_offset))     / (float)(win > 1 ? win - 1 : 1);
     float x1 = band.x + (band.width * ((float)(i+1) - fract_offset)) / (float)(win > 1 ? win - 1 : 1);
@@ -1458,7 +1463,7 @@ static void draw_lissajous_cell(skope_t *s, const trace_t *t,
   if (start < 0) start = 0;
   int count = win;
   if (start + count > t->frame_count) count = t->frame_count - start;
-  if (count < 2) return;
+  if (win < 2) return;
 
   int chl = p * 2, chr = p * 2 + 1;
   float vpd = s->pairs[p].volts_per_div;

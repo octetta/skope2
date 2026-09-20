@@ -164,10 +164,15 @@ static text_mode_t g_text_mode; // mirrors s->text_mode; synced once per frame
 // ---------------------------------------------------------------------------
 
 typedef enum {
+  VIZ_TIME = 0,
+  VIZ_XY,
+  VIZ_XY_ROT,
+  VIZ_COUNT
+} pair_viz_mode_t;
+
+typedef enum {
   VIEW_STACKED = 0,   // one band per pair, L/R with stereo fill
   VIEW_OVERLAY,       // all pairs on one grid
-  VIEW_LISSAJOUS,     // X-Y phase scope, grid of pairs
-  VIEW_LISSAJOUS_ROT, // X-Y phase scope, slowly rotating
   VIEW_COUNT
 } view_mode_t;
 
@@ -192,6 +197,7 @@ typedef struct {
   int     enabled;
   float   volts_per_div;   // amplitude scale factor (normalised float units per division)
   float   offset_div;      // vertical centre offset in divisions
+  pair_viz_mode_t viz_mode;
 } pair_state_t;
 
 // ---------------------------------------------------------------------------
@@ -328,8 +334,8 @@ static void   skope_draw_stacked(skope_t *s, const trace_t *t,
                                   Rectangle plot, float alpha);
 static void   skope_draw_overlay(skope_t *s, const trace_t *t,
                                   Rectangle plot, float alpha);
-static void   skope_draw_lissajous(skope_t *s, const trace_t *t,
-                                    Rectangle plot, float alpha);
+static void draw_lissajous_cell(skope_t *s, const trace_t *t, Rectangle cell, int p, float alpha, float rot);
+
 static void   skope_draw_hud(skope_t *s, float hud_y, float hud_h);
 static void   skope_draw_help(skope_t *s);
 static void   skope_draw_buffer_overview(skope_t *s, Rectangle r);
@@ -440,6 +446,7 @@ static void skope_init(skope_t *s, const char *name) {
     s->pairs[p].enabled      = 1;
     s->pairs[p].volts_per_div = 0.2f;
     s->pairs[p].offset_div   = 0.0f;
+    s->pairs[p].viz_mode     = VIZ_TIME;
   }
   s->selected_pair = 0;
 
@@ -958,7 +965,11 @@ static int skope_handle_input(skope_t *s) {
 
   // View mode: V
   if (IsKeyPressed(KEY_V)) {
-    s->view_mode = (view_mode_t)((s->view_mode + 1) % VIEW_COUNT);
+    if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
+        s->view_mode = (view_mode_t)((s->view_mode + 1) % VIEW_COUNT);
+    } else {
+        s->pairs[s->selected_pair].viz_mode = (pair_viz_mode_t)((s->pairs[s->selected_pair].viz_mode + 1) % VIZ_COUNT);
+    }
     changed = 1;
   }
 
@@ -1254,13 +1265,17 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
 
     Rectangle band = {plot.x, band_y, usable_w, band_h};
 
-    // Grid inside band (4 horizontal divs, 8 vertical)
-    if (s->show_grid) skope_draw_grid(band, 10, 8, s->dpi_y, s->theme);
-
     float vpd = s->pairs[p].volts_per_div;
-    draw_pair_waveforms(band, t->samples, start, count, win,
-                        p, vpd, s->pairs[p].offset_div,
-                        div_h, alpha, s->dpi_y, t->trig_fract);
+    if (s->pairs[p].viz_mode == VIZ_TIME) {
+      if (s->show_grid) skope_draw_grid(band, 10, 8, s->dpi_y, s->theme);
+      draw_pair_waveforms(band, t->samples, start, count, win,
+                          p, vpd, s->pairs[p].offset_div,
+                          div_h, alpha, s->dpi_y, t->trig_fract);
+    } else {
+      if (s->show_grid) skope_draw_grid(band, 8, 8, s->dpi_y, s->theme);
+      float rot = (s->pairs[p].viz_mode == VIZ_XY_ROT) ? (float)GetTime() * 1.5f : 0.0f;
+      draw_lissajous_cell(s, t, band, p, alpha, rot);
+    }
 
     // --- Band labels and readout (Tek-style) --------------------------------
     // All spacing uses g_hd_cell_h (actual rendered glyph height) and
@@ -1395,9 +1410,14 @@ static void skope_draw_overlay(skope_t *s, const trace_t *t,
     if (!s->pairs[p].enabled) continue;
     float vpd = s->pairs[p].volts_per_div;
     if (vpd < 1e-5f) vpd = 1e-5f;
-    draw_pair_waveforms(plot, t->samples, start, count, win,
-                        p, vpd, s->pairs[p].offset_div,
-                        div_h, alpha, s->dpi_y, t->trig_fract);
+    if (s->pairs[p].viz_mode == VIZ_TIME) {
+      draw_pair_waveforms(plot, t->samples, start, count, win,
+                          p, vpd, s->pairs[p].offset_div,
+                          div_h, alpha, s->dpi_y, t->trig_fract);
+    } else {
+      float rot = (s->pairs[p].viz_mode == VIZ_XY_ROT) ? (float)GetTime() * 1.5f : 0.0f;
+      draw_lissajous_cell(s, t, plot, p, alpha, rot);
+    }
   }
 
   // Trigger line — amber dashed horizontal + edge marker
@@ -1510,62 +1530,6 @@ static void draw_lissajous_cell(skope_t *s, const trace_t *t,
            g_hd_cell_h, lcol);
 }
 
-static void skope_draw_lissajous(skope_t *s, const trace_t *t,
-                                  Rectangle plot, float alpha) {
-  if (!t->valid || t->frame_count < 2) return;
-
-  float rot = 0.0f;
-  if (s->view_mode == VIEW_LISSAJOUS_ROT) {
-    float speed = 0.4f; // radians/sec — tweak to taste
-    rot = fmodf((float)skope_now() * speed, 2.0f * PI);
-  }
-
-  int active = 0;
-  for (int p = 0; p < SKOPE_NUM_PAIRS; p++) if (s->pairs[p].enabled) active++;
-  if (!active) return;
-
-  // Layout: up to 3 cells wide, rows as needed
-  int cols = active <= 2 ? active : (active <= 4 ? 2 : 3);
-  int rows = (active + cols - 1) / cols;
-
-  float cell_w = plot.width  / (float)cols;
-  float cell_h = plot.height / (float)rows;
-  // Make cells square (use the smaller of cell_w, cell_h)
-  float cell_sz = cell_w < cell_h ? cell_w : cell_h;
-
-  // Centre the grid
-  float grid_w = cell_sz * cols;
-  float grid_h = cell_sz * rows;
-  float ox = plot.x + (plot.width  - grid_w) / 2.0f;
-  float oy = plot.y + (plot.height - grid_h) / 2.0f;
-
-  int col = 0, row = 0;
-  for (int p = 0; p < SKOPE_NUM_PAIRS; p++) {
-    if (!s->pairs[p].enabled) continue;
-
-    float pad = 4.0f * s->dpi_x;
-    Rectangle cell = {
-      ox + col * cell_sz + pad,
-      oy + row * cell_sz + pad,
-      cell_sz - pad * 2,
-      cell_sz - pad * 2
-    };
-
-    // Cell — slightly recessed CRT look, thin border in pair color at low alpha
-    DrawRectangleRec(cell, TH(s, crt_bg));
-    Color border_col = (Color){kPairColor[p].r, kPairColor[p].g,
-                                kPairColor[p].b, 55};
-    DrawRectangleLinesEx(cell, 1, border_col);
-
-    if (s->show_grid) skope_draw_grid(cell, 8, 8, s->dpi_y, s->theme);
-
-    draw_lissajous_cell(s, t, cell, p, alpha, rot);
-
-    col++;
-    if (col >= cols) { col = 0; row++; }
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Master draw
 // ---------------------------------------------------------------------------
@@ -1574,8 +1538,6 @@ static const char *view_name(view_mode_t v) {
   switch(v) {
     case VIEW_STACKED:       return "STACKED";
     case VIEW_OVERLAY:       return "OVERLAY";
-    case VIEW_LISSAJOUS:     return "LISSAJOUS";
-    case VIEW_LISSAJOUS_ROT: return "LISSAJOUS-ROT";
     default: return "?";
   }
 }
@@ -1740,7 +1702,7 @@ static void skope_draw(skope_t *s) {
         if (a < 0.02f) continue;
         if      (s->view_mode == VIEW_STACKED)   skope_draw_stacked(s, ht, crt, a);
         else if (s->view_mode == VIEW_OVERLAY)   skope_draw_overlay(s, ht, crt, a);
-        else                                      skope_draw_lissajous(s, ht, crt, a);
+
       }
     }
     // Current trace
@@ -1748,7 +1710,7 @@ static void skope_draw(skope_t *s) {
       trace_t *ct = &s->history[s->history_head];
       if      (s->view_mode == VIEW_STACKED)   skope_draw_stacked(s, ct, crt, 1.0f);
       else if (s->view_mode == VIEW_OVERLAY)   skope_draw_overlay(s, ct, crt, 1.0f);
-      else                                      skope_draw_lissajous(s, ct, crt, 1.0f);
+
     }
   }
 
@@ -1947,9 +1909,9 @@ static void skope_draw_hud(skope_t *s, float hud_y, float hud_h) {
   typedef struct { const char *label; const char *key; int active; } sk_t;
   const char *tmode_str = s->trig_mode == TRIG_AUTO   ? "AUTO"
                         : s->trig_mode == TRIG_NORMAL ? "NORM" : "SNGL";
-  const char *view_str  = s->view_mode == VIEW_STACKED   ? "STKD"
-                        : s->view_mode == VIEW_OVERLAY   ? "OVLY"
-                        : s->view_mode == VIEW_LISSAJOUS ? "X-Y" : "X-Y*";
+  const char *view_str  = s->pairs[s->selected_pair].viz_mode == VIZ_TIME ? "TIME"
+                        : s->pairs[s->selected_pair].viz_mode == VIZ_XY ? "X-Y"
+                        : "X-Y*";
 
   sk_t keys[] = {
     { tmode_str,                              "T",   1               },

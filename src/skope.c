@@ -1524,13 +1524,8 @@ static void draw_lissajous_cell(skope_t *s, const trace_t *t,
            (int)(cell.y + cell.height - g_hd_cell_h - 3),
            g_hd_cell_h, ccol);
 
-  // Pair name — top-left of cell
-  Color lcol = color_alpha(kPairColor[p], alpha);
-  tek_text(skope_pair_name(s, p),
-           (int)(cell.x + g_hd_cell_w),
-           (int)(cell.y + 3),
-           g_hd_cell_h, lcol);
 }
+
 
 
 static void skope_draw_grid_layout(skope_t *s, const trace_t *t, Rectangle plot, float alpha) {

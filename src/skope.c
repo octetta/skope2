@@ -1238,10 +1238,11 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
     ? s->reader.header->sample_rate : 44100;
 
   int win = frames_for_window(s, t->frame_count);
-  int start = t->frame_count - win;
+  int start;
   if (s->trig_mode != TRIG_AUTO || t->trig_idx > 0) {
-      // Anchor trigger at 2 divisions from the left (out of 10 divs total = 20%)
       start = t->trig_idx - (int)(0.2f * win);
+  } else {
+      start = t->frame_count / 3 - (int)(0.2f * win);
   }
   if (start < 0) start = 0;
   int count = win;
@@ -1397,10 +1398,11 @@ static void skope_draw_overlay(skope_t *s, const trace_t *t,
   if (!t->valid || t->frame_count < 2) return;
 
   int win   = frames_for_window(s, t->frame_count);
-  int start = t->frame_count - win;
+  int start;
   if (s->trig_mode != TRIG_AUTO || t->trig_idx > 0) {
-      // Anchor trigger at 2 divisions from the left (out of 10 divs total = 20%)
       start = t->trig_idx - (int)(0.2f * win);
+  } else {
+      start = t->frame_count / 3 - (int)(0.2f * win);
   }
   if (start < 0) start = 0;
   int count = win;
@@ -1447,10 +1449,11 @@ static void skope_draw_overlay(skope_t *s, const trace_t *t,
 static void draw_lissajous_cell(skope_t *s, const trace_t *t,
                                  Rectangle cell, int p, float alpha, float rot) {
   int win   = frames_for_window(s, t->frame_count);
-  int start = t->frame_count - win;
+  int start;
   if (s->trig_mode != TRIG_AUTO || t->trig_idx > 0) {
-      // Anchor trigger at 2 divisions from the left (out of 10 divs total = 20%)
       start = t->trig_idx - (int)(0.2f * win);
+  } else {
+      start = t->frame_count / 3 - (int)(0.2f * win);
   }
   if (start < 0) start = 0;
   int count = win;
@@ -1532,9 +1535,11 @@ static void skope_draw_grid_layout(skope_t *s, const trace_t *t, Rectangle plot,
   if (!t->valid || t->frame_count < 2) return;
 
   int win   = frames_for_window(s, t->frame_count);
-  int start = t->frame_count - win;
+  int start;
   if (s->trig_mode != TRIG_AUTO || t->trig_idx > 0) {
       start = t->trig_idx - (int)(0.2f * win);
+  } else {
+      start = t->frame_count / 3 - (int)(0.2f * win);
   }
   if (start < 0) start = 0;
   int count = win;

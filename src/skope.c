@@ -173,6 +173,7 @@ typedef enum {
 typedef enum {
   VIEW_STACKED = 0,   // one band per pair, L/R with stereo fill
   VIEW_OVERLAY,       // all pairs on one grid
+  VIEW_GRID,          // side-by-side/top-to-bottom squares
   VIEW_COUNT
 } view_mode_t;
 
@@ -1288,23 +1289,24 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
     Color lcol = color_alpha(kPairColor[p], alpha);
     Color rcol = color_alpha(pair_color_r(p), alpha);
 
-    // Left-edge channel marker: filled triangle, centred on DC-zero line
-    float dc_y = band_y + band_h / 2.0f - s->pairs[p].offset_div * div_h;
-    dc_y = fmaxf(band_y + 2, fminf(band_y + band_h - 2, dc_y));
     float mkr_sz = (float)(fh);
-    tek_channel_marker(plot.x + mkr_sz + 2, dc_y, mkr_sz, lcol);
-
-    // Row 0 (top of band): pair name + "L" "R" legend + V/div right-aligned
     int row0_y = (int)(band_y + 2);
-
     const char *pname = skope_pair_name(s, p);
-    tek_text(pname, (int)(plot.x + mkr_sz + fw),
-             row0_y, fh, lcol);
-
-    int lbl_w = tek_measure(pname);
-    int leg_x = (int)(plot.x + mkr_sz + fw) + lbl_w + fw;
-    tek_text("L", leg_x,            row0_y, fh, lcol);
-    tek_text("R", leg_x + fw * 2,   row0_y, fh, rcol);
+    
+    if (s->pairs[p].viz_mode == VIZ_TIME) {
+      float dc_y = band_y + band_h / 2.0f - s->pairs[p].offset_div * div_h;
+      dc_y = fmaxf(band_y + 2, fminf(band_y + band_h - 2, dc_y));
+      
+      tek_channel_marker(plot.x + mkr_sz + 2, dc_y, mkr_sz, lcol);
+      
+      tek_text(pname, (int)(plot.x + mkr_sz + fw), row0_y, fh, lcol);
+      int lbl_w = tek_measure(pname);
+      int leg_x = (int)(plot.x + mkr_sz + fw) + lbl_w + fw;
+      tek_text("L", leg_x,            row0_y, fh, lcol);
+      tek_text("R", leg_x + fw * 2,   row0_y, fh, rcol);
+    } else {
+      tek_text(pname, (int)(plot.x + 2), row0_y, fh, lcol);
+    }
 
     // Scale annotation — right-aligned in the usable band width.
     // We don't know the physical unit (V, dBu, etc.) — skred hasn't
@@ -1325,7 +1327,7 @@ static void skope_draw_stacked(skope_t *s, const trace_t *t,
              row0_y, fh, color_alpha(TH(s, p31_mid), alpha));
 
     // Row 1: correlation value — only if band is tall enough for two rows
-    if (band_h >= (float)(fh * 2 + 6)) {
+    if (s->pairs[p].viz_mode == VIZ_TIME && band_h >= (float)(fh * 2 + 6)) {
       int row1_y = row0_y + fh + 2;
       float corr = stereo_correlation(t->samples, start, count, p);
       char corr_str[24];
@@ -1530,6 +1532,82 @@ static void draw_lissajous_cell(skope_t *s, const trace_t *t,
            g_hd_cell_h, lcol);
 }
 
+
+static void skope_draw_grid_layout(skope_t *s, const trace_t *t, Rectangle plot, float alpha) {
+  if (!t->valid || t->frame_count < 2) return;
+
+  int win   = frames_for_window(s, t->frame_count);
+  int start = t->frame_count - win;
+  if (s->trig_mode != TRIG_AUTO || t->trig_idx > 0) {
+      start = t->trig_idx - (int)(0.2f * win);
+  }
+  if (start < 0) start = 0;
+  int count = win;
+  if (start + count > t->frame_count) count = t->frame_count - start;
+
+  int active = 0;
+  for (int p = 0; p < SKOPE_NUM_PAIRS; p++) if (s->pairs[p].enabled) active++;
+  if (!active) return;
+
+  int cols = active <= 2 ? active : (active <= 4 ? 2 : 3);
+  int rows = (active + cols - 1) / cols;
+
+  float cell_w = plot.width  / (float)cols;
+  float cell_h = plot.height / (float)rows;
+  float cell_sz = cell_w < cell_h ? cell_w : cell_h;
+
+  float grid_w = cell_sz * cols;
+  float grid_h = cell_sz * rows;
+  float ox = plot.x + (plot.width  - grid_w) / 2.0f;
+  float oy = plot.y + (plot.height - grid_h) / 2.0f;
+
+  int col = 0, row = 0;
+  for (int p = 0; p < SKOPE_NUM_PAIRS; p++) {
+    if (!s->pairs[p].enabled) continue;
+
+    float pad = 4.0f * s->dpi_x;
+    Rectangle cell = {
+      ox + col * cell_sz + pad,
+      oy + row * cell_sz + pad,
+      cell_sz - pad * 2,
+      cell_sz - pad * 2
+    };
+
+    DrawRectangleRec(cell, TH(s, crt_bg));
+    Color border_col = (Color){kPairColor[p].r, kPairColor[p].g,
+                                kPairColor[p].b, 55};
+    DrawRectangleLinesEx(cell, 1, border_col);
+
+    float vpd = s->pairs[p].volts_per_div;
+    if (s->pairs[p].viz_mode == VIZ_TIME) {
+      if (s->show_grid) skope_draw_grid(cell, 10, 8, s->dpi_y, s->theme);
+      float div_h = cell.height / 8.0f;
+      draw_pair_waveforms(cell, t->samples, start, count, win,
+                          p, vpd, s->pairs[p].offset_div,
+                          div_h, alpha, s->dpi_y, t->trig_fract);
+    } else {
+      if (s->show_grid) skope_draw_grid(cell, 8, 8, s->dpi_y, s->theme);
+      float rot = (s->pairs[p].viz_mode == VIZ_XY_ROT) ? (float)GetTime() * 1.5f : 0.0f;
+      draw_lissajous_cell(s, t, cell, p, alpha, rot);
+    }
+
+    // Name and scale in corner
+    int fh = g_hd_cell_h;
+    Color lcol = color_alpha(kPairColor[p], alpha);
+    int row0_y = (int)(cell.y + 2);
+    const char *pname = skope_pair_name(s, p);
+    tek_text(pname, (int)(cell.x + 2), row0_y, fh, lcol);
+    
+    char scale_str[32];
+    snprintf(scale_str, sizeof(scale_str), "%.2f/D", vpd);
+    int vw = tek_measure(scale_str);
+    tek_text(scale_str, (int)(cell.x + cell.width - vw - 2), row0_y, fh, color_alpha(TH(s, p31_mid), alpha));
+
+    col++;
+    if (col >= cols) { col = 0; row++; }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Master draw
 // ---------------------------------------------------------------------------
@@ -1538,6 +1616,7 @@ static const char *view_name(view_mode_t v) {
   switch(v) {
     case VIEW_STACKED:       return "STACKED";
     case VIEW_OVERLAY:       return "OVERLAY";
+    case VIEW_GRID:          return "GRID";
     default: return "?";
   }
 }
@@ -1710,6 +1789,7 @@ static void skope_draw(skope_t *s) {
       trace_t *ct = &s->history[s->history_head];
       if      (s->view_mode == VIEW_STACKED)   skope_draw_stacked(s, ct, crt, 1.0f);
       else if (s->view_mode == VIEW_OVERLAY)   skope_draw_overlay(s, ct, crt, 1.0f);
+      else if (s->view_mode == VIEW_GRID)      skope_draw_grid_layout(s, ct, crt, 1.0f);
 
     }
   }
